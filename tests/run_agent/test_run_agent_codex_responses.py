@@ -306,9 +306,23 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert kwargs["parallel_tool_calls"] is True
     assert isinstance(kwargs["prompt_cache_key"], str)
     assert len(kwargs["prompt_cache_key"]) > 0
-    assert "timeout" not in kwargs
+    assert kwargs["timeout"] == 1800.0
     assert "max_tokens" not in kwargs
     assert "extra_body" not in kwargs
+
+
+def test_build_api_kwargs_codex_preserves_configured_timeout(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    monkeypatch.setattr(run_agent, "get_provider_request_timeout", lambda *_args, **_kwargs: 123.0)
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+
+    assert kwargs["timeout"] == 123.0
 
 
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
@@ -1051,6 +1065,28 @@ def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
     from agent.codex_responses_adapter import _preflight_codex_api_kwargs
     result = _preflight_codex_api_kwargs(kwargs)
     assert result["service_tier"] == "priority"
+
+
+def test_preflight_codex_api_kwargs_preserves_positive_timeout(monkeypatch):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["timeout"] = 42.5
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+    assert result["timeout"] == 42.5
+
+
+def test_preflight_codex_api_kwargs_omits_invalid_timeout(monkeypatch):
+    _build_agent(monkeypatch)
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+    for timeout in (0, -1, "slow", True, None):
+        kwargs = _codex_request_kwargs()
+        kwargs["timeout"] = timeout
+        result = _preflight_codex_api_kwargs(kwargs)
+        assert "timeout" not in result
 
 
 def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
