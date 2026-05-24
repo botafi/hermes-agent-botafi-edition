@@ -457,7 +457,18 @@ class TestStubSchemaDrift(unittest.TestCase):
     # Parameters that are internal (injected by the handler, not user-facing)
     _INTERNAL_PARAMS = {"task_id", "user_task"}
     # Parameters intentionally blocked in the sandbox
-    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
+    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns", "backend"}
+
+    def test_terminal_backend_is_blocked_from_execute_code_rpc(self):
+        """execute_code scripts must not be able to select host/local terminal backend."""
+        from tools.code_execution_tool import _TERMINAL_BLOCKED_PARAMS, _TOOL_STUBS
+
+        terminal_sig = _TOOL_STUBS["terminal"][1]
+        terminal_args_expr = _TOOL_STUBS["terminal"][3]
+
+        self.assertIn("backend", _TERMINAL_BLOCKED_PARAMS)
+        self.assertNotIn("backend", terminal_sig)
+        self.assertNotIn('"backend"', terminal_args_expr)
 
     def test_stubs_cover_all_schema_params(self):
         """Every user-facing parameter in the real schema must appear in the
