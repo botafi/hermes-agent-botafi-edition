@@ -1409,7 +1409,8 @@ def is_persistent_env(task_id: str, backend: Optional[str] = None) -> bool:
 
 def cleanup_all_environments():
     """Clean up ALL active environments. Use with caution."""
-    keys = list(_active_environments.keys())
+    with _env_lock:
+        keys = list(_active_environments.keys())
     cleaned = 0
     
     for cache_key in keys:
@@ -1455,9 +1456,10 @@ def cleanup_vm(task_id: Union[str, _ENV_CACHE_KEY], backend: Optional[str] = Non
     else:
         # Backward compat: clean all backends for this task_id
         lookup = _resolve_container_task_id(task_id)
-        keys_to_clean = [
-            k for k in _active_environments if _cache_key_task_id(k) == lookup
-        ]
+        with _env_lock:
+            keys_to_clean = [
+                k for k in _active_environments if _cache_key_task_id(k) == lookup
+            ]
         if not keys_to_clean:
             keys_to_clean = [task_id]
 
