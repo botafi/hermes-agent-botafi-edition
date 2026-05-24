@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from typing import Optional
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
@@ -78,23 +79,44 @@ _BLOCKED_DEVICE_PATHS = frozenset({
 })
 
 
-def _resolve_path(filepath: str, task_id: str = "default") -> Path:
-    """Resolve a path relative to TERMINAL_CWD (the worktree base directory)
+def _resolve_path(filepath: str, task_id: str = "default",
+                  backend: Optional[str] = None) -> Path:
+    """Resolve a path relative to the configured cwd (the worktree base directory)
     instead of the main repository root.
     """
-    return _resolve_path_for_task(filepath, task_id)
+    return _resolve_path_for_task(filepath, task_id, backend=backend)
 
 
-def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
-    """Return the task's live terminal cwd for bookkeeping when available."""
+def _get_live_tracking_cwd(task_id: str = "default", backend: Optional[str] = None) -> str | None:
+    """Return the task's live terminal cwd for bookkeeping when available.
+
+    When *backend* is given, resolves the cwd for that specific backend
+    so path guards and dedup/staleness bookkeeping use the same base
+    directory that ``_get_file_ops(backend=...)`` will operate against.
+    """
     try:
         from tools.terminal_tool import _resolve_container_task_id
         container_key = _resolve_container_task_id(task_id)
     except Exception:
         container_key = task_id
 
+    try:
+        from tools.terminal_tool import _get_env_config, _active_environments, _env_lock
+
+        config = _get_env_config()
+        configured_env_type = config.get("env_type", "local")
+        normalized_backend = _normalize_file_backend(backend)
+        effective_env_type = normalized_backend if normalized_backend is not None else configured_env_type
+        env_key = (container_key, effective_env_type)
+    except Exception:
+        effective_env_type = None
+        env_key = None
+
     with _file_ops_lock:
-        cached = _file_ops_cache.get(container_key) or _file_ops_cache.get(task_id)
+        if effective_env_type is not None and backend is not None and env_key is not None:
+            cached = _file_ops_cache.get(env_key)
+        else:
+            cached = _file_ops_cache.get(container_key) or _file_ops_cache.get(task_id)
     if cached is not None:
         live_cwd = getattr(getattr(cached, "env", None), "cwd", None) or getattr(
             cached, "cwd", None
@@ -103,30 +125,88 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
             return live_cwd
 
     try:
-        from tools.terminal_tool import _active_environments, _env_lock, _get_env_config
-
-        env_type = _get_env_config()["env_type"]
-        env_key = (container_key, env_type)
-        with _env_lock:
-            env = (
-                _active_environments.get(env_key)
-                or _active_environments.get(container_key)
-                or _active_environments.get(task_id)
-            )
-            live_cwd = getattr(env, "cwd", None) if env is not None else None
-        if live_cwd:
-            return live_cwd
+        if env_key is not None:
+            with _env_lock:
+                env = (
+                    _active_environments.get(env_key)
+                    or (None if backend is not None else _active_environments.get(container_key))
+                    or (None if backend is not None else _active_environments.get(task_id))
+                )
+                live_cwd = getattr(env, "cwd", None) if env is not None else None
+            if live_cwd:
+                return live_cwd
     except Exception:
         pass
+
+    # Fall back to configured cwd for the backend
+    if effective_env_type == "docker":
+        try:
+            config = _get_env_config()
+            if config.get("docker_cwd"):
+                return config["docker_cwd"]
+        except Exception:
+            pass
 
     return None
 
 
-def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
-    """Resolve *filepath* against the task's live terminal cwd when possible."""
-    p = Path(filepath).expanduser()
+def _get_live_tracking_home(task_id: str = "default", backend: Optional[str] = None) -> str | None:
+    """Return HOME for the selected backend when a live env is available."""
+    try:
+        from tools.terminal_tool import _resolve_container_task_id, _active_environments, _env_lock
+        container_key = _resolve_container_task_id(task_id)
+        normalized_backend = _normalize_file_backend(backend)
+        env_key = (container_key, normalized_backend) if normalized_backend is not None else None
+        with _env_lock:
+            env = _active_environments.get(env_key) if env_key is not None else None
+        if env is not None:
+            try:
+                result = env.execute("printf %s \"$HOME\"", timeout=5)
+                output = result.get("output") if isinstance(result, dict) else getattr(result, "stdout", "")
+                if output and str(output).strip():
+                    return str(output).strip()
+            except Exception:
+                pass
+        if normalized_backend == "docker":
+            return "/root"
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_path_for_task(filepath: str, task_id: str = "default",
+                          backend: Optional[str] = None) -> Path:
+    """Resolve *filepath* against the task's live terminal cwd when possible.
+
+    When *backend* is given, resolves against the cwd of that specific
+    backend so path guards, dedup, and staleness bookkeeping are
+    consistent with the environment that ``_get_file_ops(backend=...)``
+    will operate against.
+    """
+    raw_path = str(filepath)
+    normalized_backend = _normalize_file_backend(backend)
+
+    # For backend overrides, `~` must be interpreted in the selected
+    # backend environment, not expanded with the host process home.
+    # ShellFileOperations expands ~ via `echo $HOME`; mirror that for
+    # guard/bookkeeping paths where we can do so cheaply.
+    if raw_path == "~" or raw_path.startswith("~/"):
+        if normalized_backend is not None:
+            home = _get_live_tracking_home(task_id, backend=normalized_backend)
+            if home:
+                suffix = "" if raw_path == "~" else raw_path[1:]
+                return (Path(home) / suffix.lstrip("/")).resolve()
+        p = Path(raw_path).expanduser()
+    elif normalized_backend is not None and raw_path.startswith("~"):
+        # Avoid host-side ~user expansion for container/local override
+        # bookkeeping; leave it unresolved rather than mapping to the
+        # wrong filesystem.
+        p = Path(raw_path)
+    else:
+        p = Path(raw_path).expanduser()
+
     if not p.is_absolute():
-        base = _get_live_tracking_cwd(task_id) or os.environ.get(
+        base = _get_live_tracking_cwd(task_id, backend=backend) or os.environ.get(
             "TERMINAL_CWD", os.getcwd()
         )
         p = Path(base) / p
@@ -161,10 +241,11 @@ _SENSITIVE_PATH_PREFIXES = (
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_sensitive_path(filepath: str, task_id: str = "default",
+                         backend: Optional[str] = None) -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
+        resolved = str(_resolve_path_for_task(filepath, task_id, backend=backend))
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(os.path.expanduser(filepath))
@@ -180,7 +261,8 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
-def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_cross_profile_path(filepath: str, task_id: str = "default",
+                              backend: Optional[str] = None) -> str | None:
     """Return a cross-profile warning string when ``filepath`` lands in
     another Hermes profile's skills/plugins/cron/memories directory.
 
@@ -204,7 +286,7 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     # in a session that cd'd into ``~/.hermes/profiles/other/`` is
     # classified against the right base.
     try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
+        resolved = str(_resolve_path_for_task(filepath, task_id, backend=backend))
     except (OSError, ValueError):
         resolved = filepath
 
@@ -339,7 +421,63 @@ def _is_internal_file_status_text(content: str) -> bool:
     return False
 
 
-def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
+_ALLOWED_FILE_BACKENDS = {"local", "docker"}
+
+
+def _normalize_file_backend(backend: Optional[str]) -> Optional[str]:
+    """Normalize a file-tool backend override, preserving None.
+
+    Tool schema validation should normally guarantee a string, but direct
+    handler calls and tests can pass arbitrary JSON-ish values.  Coerce
+    non-None values to strings so validation produces a clean tool error
+    instead of crashing on unhashable values such as dict/list.
+    """
+    if backend is None:
+        return None
+    return str(backend).strip().lower()
+
+
+def _check_local_file_operation_approval(
+    backend: Optional[str],
+    tool_name: str,
+    operation: str,
+    path: str,
+    task_id: str = "default",
+) -> dict:
+    """Check whether a local file operation needs approval when Docker is the default backend.
+
+    When the configured backend is Docker and the caller explicitly requests
+    backend="local", the local file operation must be approval-gated to prevent
+    silent sandbox escape. Returns {"approved": True} when safe or
+    {"approved": False, "error": "..."} when denied.
+    """
+    from tools.terminal_tool import _get_env_config
+
+    backend_value = _normalize_file_backend(backend)
+    if backend_value is not None:
+        if backend_value not in _ALLOWED_FILE_BACKENDS:
+            return {
+                "approved": False,
+                "error": (
+                    f"Invalid backend: {backend!r}. "
+                    f"Supported values: {', '.join(sorted(_ALLOWED_FILE_BACKENDS))}"
+                ),
+            }
+
+    config = _get_env_config()
+    configured_backend = config.get("env_type", "local")
+
+    if configured_backend != "docker":
+        return {"approved": True}
+
+    if backend_value != "local":
+        return {"approved": True}
+
+    from tools.approval import check_file_operation_approval
+    return check_file_operation_approval(tool_name=tool_name, operation=operation, path=path)
+
+
+def _get_file_ops(task_id: str = "default", backend: Optional[str] = None) -> ShellFileOperations:
     """Get or create ShellFileOperations for a terminal environment.
 
     Respects the TERMINAL_ENV setting -- if the task_id doesn't have an
@@ -365,7 +503,19 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
     task_id = _resolve_container_task_id(task_id)
     config = _get_env_config()
-    env_type = config["env_type"]
+    configured_env_type = config["env_type"]
+
+    if backend is not None:
+        backend_value = _normalize_file_backend(backend)
+        if backend_value not in _ALLOWED_FILE_BACKENDS:
+            raise ValueError(
+                f"Invalid backend: {backend!r}. "
+                f"Supported values: {', '.join(sorted(_ALLOWED_FILE_BACKENDS))}"
+            )
+        env_type = backend_value
+    else:
+        env_type = configured_env_type
+
     env_key = (task_id, env_type)
 
     # Fast path: check cache -- but also verify the underlying environment
@@ -421,6 +571,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = ""
 
             cwd = overrides.get("cwd") or config["cwd"]
+            if env_type == "docker" and config.get("docker_cwd") and not overrides.get("cwd"):
+                cwd = config["docker_cwd"]
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
@@ -493,7 +645,8 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default",
+                    backend: Optional[str] = None) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -509,7 +662,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 ),
             })
 
-        _resolved = _resolve_path_for_task(path, task_id)
+        _resolved = _resolve_path_for_task(path, task_id, backend=backend)
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).
@@ -594,7 +747,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(task_id, backend=backend)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
@@ -759,7 +912,8 @@ def notify_other_tool_call(task_id: str = "default"):
                 task_data["dedup_hits"].clear()
 
 
-def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
+def _invalidate_dedup_for_path(filepath: str, task_id: str,
+                               backend: Optional[str] = None) -> None:
     """Remove all dedup cache entries whose resolved path matches *filepath*.
 
     Called after write_file and patch so that a subsequent read_file on
@@ -773,7 +927,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     internally.
     """
     try:
-        resolved = str(_resolve_path(filepath))
+        resolved = str(_resolve_path(filepath, task_id=task_id, backend=backend))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -789,7 +943,8 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
             del dedup[k]
 
 
-def _update_read_timestamp(filepath: str, task_id: str) -> None:
+def _update_read_timestamp(filepath: str, task_id: str,
+                           backend: Optional[str] = None) -> None:
     """Record the file's current modification time after a successful write.
 
     Called after write_file and patch so that consecutive edits by the
@@ -800,9 +955,9 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     subsequent reads return fresh content (fixes #13144).
     """
     # Invalidate dedup first (before acquiring lock for timestamp update).
-    _invalidate_dedup_for_path(filepath, task_id)
+    _invalidate_dedup_for_path(filepath, task_id, backend=backend)
     try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
+        resolved = str(_resolve_path_for_task(filepath, task_id, backend=backend))
         current_mtime = os.path.getmtime(resolved)
     except (OSError, ValueError):
         return
@@ -813,7 +968,8 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
             _cap_read_tracker_data(task_data)
 
 
-def _check_file_staleness(filepath: str, task_id: str) -> str | None:
+def _check_file_staleness(filepath: str, task_id: str,
+                          backend: Optional[str] = None) -> str | None:
     """Check whether a file was modified since the agent last read it.
 
     Returns a warning string if the file is stale (mtime changed since
@@ -821,7 +977,7 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     or was never read.  Does not block — the write still proceeds.
     """
     try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
+        resolved = str(_resolve_path_for_task(filepath, task_id, backend=backend))
     except (OSError, ValueError):
         return None
     with _read_tracker_lock:
@@ -845,7 +1001,8 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
-                    cross_profile: bool = False) -> str:
+                    cross_profile: bool = False,
+                    backend: Optional[str] = None) -> str:
     """Write content to a file.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
@@ -854,11 +1011,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
-    sensitive_err = _check_sensitive_path(path, task_id)
+    sensitive_err = _check_sensitive_path(path, task_id, backend=backend)
     if sensitive_err:
         return tool_error(sensitive_err)
     if not cross_profile:
-        cross_warning = _check_cross_profile_path(path, task_id)
+        cross_warning = _check_cross_profile_path(path, task_id, backend=backend)
         if cross_warning:
             return tool_error(cross_warning)
     if _is_internal_file_status_text(content):
@@ -871,18 +1028,18 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.
         try:
-            _resolved = str(_resolve_path_for_task(path, task_id))
+            _resolved = str(_resolve_path_for_task(path, task_id, backend=backend))
         except Exception:
             _resolved = None
 
         if _resolved is None:
-            stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
+            stale_warning = _check_file_staleness(path, task_id, backend=backend)
+            file_ops = _get_file_ops(task_id, backend=backend)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
-            _update_read_timestamp(path, task_id)
+            _update_read_timestamp(path, task_id, backend=backend)
             return json.dumps(result_dict, ensure_ascii=False)
 
         # Serialize the read→modify→write region per-path so concurrent
@@ -892,8 +1049,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
-            stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
+            stale_warning = _check_file_staleness(path, task_id, backend=backend)
+            file_ops = _get_file_ops(task_id, backend=backend)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning
@@ -901,7 +1058,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 result_dict["_warning"] = effective_warning
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
-            _update_read_timestamp(path, task_id)
+            _update_read_timestamp(path, task_id, backend=backend)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
         return json.dumps(result_dict, ensure_ascii=False)
@@ -915,7 +1072,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default", cross_profile: bool = False) -> str:
+               task_id: str = "default", cross_profile: bool = False,
+               backend: Optional[str] = None) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
@@ -931,11 +1089,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
-        sensitive_err = _check_sensitive_path(_p, task_id)
+        sensitive_err = _check_sensitive_path(_p, task_id, backend=backend)
         if sensitive_err:
             return tool_error(sensitive_err)
         if not cross_profile:
-            cross_warning = _check_cross_profile_path(_p, task_id)
+            cross_warning = _check_cross_profile_path(_p, task_id, backend=backend)
             if cross_warning:
                 return tool_error(cross_warning)
     try:
@@ -946,7 +1104,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         _seen: set[str] = set()
         for _p in _paths_to_check:
             try:
-                _r = str(_resolve_path_for_task(_p, task_id))
+                _r = str(_resolve_path_for_task(_p, task_id, backend=backend))
             except Exception:
                 _r = None
             if _r and _r not in _seen:
@@ -968,16 +1126,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
                 try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
+                    _r = str(_resolve_path_for_task(_p, task_id, backend=backend))
                 except Exception:
                     _r = None
                 _path_to_resolved[_p] = _r
                 _cross = file_state.check_stale(task_id, _r) if _r else None
-                _sw = _cross or _check_file_staleness(_p, task_id)
+                _sw = _cross or _check_file_staleness(_p, task_id, backend=backend)
                 if _sw:
                     stale_warnings.append(_sw)
 
-            file_ops = _get_file_ops(task_id)
+            file_ops = _get_file_ops(task_id, backend=backend)
 
             if mode == "replace":
                 if not path:
@@ -999,7 +1157,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # consecutive edits by this task don't trigger false warnings.
             if not result_dict.get("error"):
                 for _p in _paths_to_check:
-                    _update_read_timestamp(_p, task_id)
+                    _update_read_timestamp(_p, task_id, backend=backend)
                     _r = _path_to_resolved.get(_p)
                     if _r:
                         file_state.note_write(task_id, _r)
@@ -1021,7 +1179,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
-                task_id: str = "default") -> str:
+                task_id: str = "default",
+                backend: Optional[str] = None) -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
@@ -1060,7 +1219,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(task_id, backend=backend)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
@@ -1109,7 +1268,8 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000},
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["path"]
     }
@@ -1128,6 +1288,7 @@ WRITE_FILE_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["path", "content"]
     }
@@ -1179,6 +1340,7 @@ PATCH_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
                 "default": False,
             },
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["mode"],
     },
@@ -1197,20 +1359,59 @@ SEARCH_FILES_SCHEMA = {
             "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
             "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0},
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["pattern"]
     }
 }
 
 
+def _handle_approval_denial(approval: dict) -> str:
+    """Return a structured JSON response for a denied or pending file operation.
+
+    When the approval response carries structured fields (status,
+    pattern_key, description), propagate them so the gateway / client
+    can render and resolve approvals — mirroring the terminal tool's
+    structured rejection format.  Otherwise fall back to a plain
+    ``tool_error`` from the ``error`` field.
+    """
+    extra = {}
+    if approval.get("status"):
+        extra["status"] = approval["status"]
+    if approval.get("pattern_key"):
+        extra["pattern_key"] = approval["pattern_key"]
+    if approval.get("description"):
+        extra["description"] = approval["description"]
+    if approval.get("command"):
+        extra["command"] = approval["command"]
+    if extra:
+        return json.dumps({
+            "error": approval.get("error", "Local file operation denied."),
+            "approved": False,
+            **extra,
+        })
+    return tool_error(approval.get("error", "Local file operation denied."))
+
+
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    backend = _normalize_file_backend(args.get("backend"))
+    if not args.get("path") or not isinstance(args.get("path"), str):
+        return tool_error("read_file: missing required field 'path'.")
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="read_file", operation="read",
+            path=args.get("path", ""), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return _handle_approval_denial(approval)
+    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid, backend=backend)
 
 
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
+    backend = _normalize_file_backend(args.get("backend"))
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
             "write_file: missing required field 'path'. Re-emit the tool call with "
@@ -1224,6 +1425,13 @@ def _handle_write_file(args, **kw):
             "payload, or use execute_code with hermes_tools.write_file() for very "
             "large files."
         )
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="write_file", operation="write",
+            path=args.get("path", ""), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return _handle_approval_denial(approval)
     if not isinstance(args["content"], str):
         return tool_error(
             f"write_file: 'content' must be a string, got "
@@ -1232,28 +1440,53 @@ def _handle_write_file(args, **kw):
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        backend=backend,
     )
 
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    backend = _normalize_file_backend(args.get("backend"))
+    if args.get("mode", "replace") != "patch" and not args.get("path"):
+        return tool_error("patch: missing required field 'path'.")
+    if args.get("mode", "replace") == "patch" and not args.get("patch"):
+        return tool_error("patch: missing required field 'patch'.")
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="patch", operation="patch",
+            path=args.get("path", ""), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return _handle_approval_denial(approval)
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        backend=backend,
     )
 
 
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
+    backend = _normalize_file_backend(args.get("backend"))
+    if not args.get("pattern") or not isinstance(args.get("pattern"), str):
+        return tool_error("search_files: missing required field 'pattern'.")
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="search_files", operation="search",
+            path=args.get("path", "."), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return _handle_approval_denial(approval)
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid,
+        backend=backend)
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
