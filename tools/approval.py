@@ -1450,6 +1450,11 @@ def check_file_operation_approval(
 
     session_key = get_current_session_key()
 
+    # Check if this file tool is already session-approved.
+    file_pattern_key = f"file:{tool_name}"
+    if is_approved(session_key, file_pattern_key):
+        return {"approved": True}
+
     if is_gateway or is_ask:
         notify_cb = None
         with _lock:
@@ -1461,6 +1466,8 @@ def check_file_operation_approval(
                 "description": description,
                 "pattern_key": f"file:{tool_name}",
                 "pattern_keys": [f"file:{tool_name}"],
+                "approval_kind": "file_backend_local",
+                "tool_name": tool_name,
             }
             entry = _ApprovalEntry(approval_data)
             with _lock:
@@ -1561,6 +1568,12 @@ def check_file_operation_approval(
                     ),
                 }
 
+            # Persist session-level approval.  "always" is demoted to
+            # session-only for file local-backend approvals so stale
+            # clients cannot silently persist permanent entries.
+            if choice in ("session", "always"):
+                approve_session(session_key, file_pattern_key)
+
             return {"approved": True, "user_approved": True}
 
         approval_payload = {
@@ -1568,6 +1581,8 @@ def check_file_operation_approval(
             "pattern_key": f"file:{tool_name}",
             "pattern_keys": [f"file:{tool_name}"],
             "description": description,
+            "approval_kind": "file_backend_local",
+            "tool_name": tool_name,
         }
         submit_pending(session_key, approval_payload)
         return {

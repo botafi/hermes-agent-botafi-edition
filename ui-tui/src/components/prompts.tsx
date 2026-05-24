@@ -7,7 +7,8 @@ import type { ApprovalReq, ClarifyReq, ConfirmReq } from '../types.js'
 
 import { TextInput } from './textInput.js'
 
-const OPTS = ['once', 'session', 'always', 'deny'] as const
+const COMMAND_APPROVAL_OPTS = ['once', 'session', 'always', 'deny'] as const
+const FILE_APPROVAL_OPTS = ['once', 'session', 'deny'] as const
 const LABELS = { always: 'Always allow', deny: 'Deny', once: 'Allow once', session: 'Allow this session' } as const
 const CMD_PREVIEW_LINES = 10
 
@@ -19,9 +20,18 @@ type ApprovalKey = {
 }
 
 type ApprovalAction =
-  | { kind: 'choose'; choice: (typeof OPTS)[number] }
+  | { kind: 'choose'; choice: (typeof COMMAND_APPROVAL_OPTS)[number] }
   | { kind: 'move'; delta: -1 | 1 }
   | { kind: 'noop' }
+
+type ApprovalOption = (typeof COMMAND_APPROVAL_OPTS)[number]
+
+export function approvalOptions(req?: Pick<ApprovalReq, 'approval_kind' | 'pattern_key'>): readonly ApprovalOption[] {
+  if (req?.approval_kind === 'file_backend_local' || req?.pattern_key?.startsWith('file:')) {
+    return FILE_APPROVAL_OPTS
+  }
+  return COMMAND_APPROVAL_OPTS
+}
 
 /**
  * Pure key-dispatch for the approval prompt — exported so the regression
@@ -34,26 +44,27 @@ type ApprovalAction =
  * for approvals).  Numbers 1..OPTS.length pick the labelled choice.  Enter
  * confirms the current selection.  ↑/↓ moves the selection within bounds.
  */
-export function approvalAction(ch: string, key: ApprovalKey, sel: number): ApprovalAction {
+export function approvalAction(ch: string, key: ApprovalKey, sel: number,
+                               opts: readonly ApprovalOption[] = COMMAND_APPROVAL_OPTS): ApprovalAction {
   if (key.escape) {
     return { kind: 'choose', choice: 'deny' }
   }
 
   const n = parseInt(ch, 10)
 
-  if (n >= 1 && n <= OPTS.length) {
-    return { kind: 'choose', choice: OPTS[n - 1]! }
+  if (n >= 1 && n <= opts.length) {
+    return { kind: 'choose', choice: opts[n - 1]! }
   }
 
   if (key.return) {
-    return { kind: 'choose', choice: OPTS[sel]! }
+    return { kind: 'choose', choice: opts[Math.min(sel, opts.length - 1)]! }
   }
 
   if (key.upArrow && sel > 0) {
     return { kind: 'move', delta: -1 }
   }
 
-  if (key.downArrow && sel < OPTS.length - 1) {
+  if (key.downArrow && sel < opts.length - 1) {
     return { kind: 'move', delta: 1 }
   }
 
@@ -62,9 +73,10 @@ export function approvalAction(ch: string, key: ApprovalKey, sel: number): Appro
 
 export function ApprovalPrompt({ onChoice, req, t }: ApprovalPromptProps) {
   const [sel, setSel] = useState(0)
+  const opts = approvalOptions(req)
 
   useInput((ch, key) => {
-    const action = approvalAction(ch, key, sel)
+    const action = approvalAction(ch, key, sel, opts)
 
     if (action.kind === 'choose') {
       onChoice(action.choice)
@@ -99,7 +111,7 @@ export function ApprovalPrompt({ onChoice, req, t }: ApprovalPromptProps) {
 
       <Text />
 
-      {OPTS.map((o, i) => (
+      {opts.map((o, i) => (
         <Text key={o}>
           <Text bold={sel === i} color={sel === i ? t.color.warn : t.color.muted} inverse={sel === i}>
             {sel === i ? '▸ ' : '  '}
@@ -108,7 +120,7 @@ export function ApprovalPrompt({ onChoice, req, t }: ApprovalPromptProps) {
         </Text>
       ))}
 
-      <Text color={t.color.muted}>↑/↓ select · Enter confirm · 1-4 quick pick · Esc/Ctrl+C deny</Text>
+      <Text color={t.color.muted}>↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C deny</Text>
     </Box>
   )
 }
