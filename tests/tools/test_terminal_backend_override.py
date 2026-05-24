@@ -621,6 +621,90 @@ def test_handler_blocks_denied_call_without_mutation(monkeypatch):
     assert len(operation_proceeded) == 0
 
 
+
+def test_file_approval_normalizes_backend_before_gating(monkeypatch):
+    """Whitespace/case variants of local must still trigger approval gating."""
+    approval_calls = []
+
+    def fake_check(tool_name=None, operation=None, path=None):
+        approval_calls.append({"tool_name": tool_name, "operation": operation, "path": path})
+        return {"approved": False, "error": "approval required"}
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    from tools import approval as approval_mod
+    monkeypatch.setattr(approval_mod, "check_file_operation_approval", fake_check)
+
+    result = json.loads(file_tools._handle_read_file({
+        "path": "/etc/shadow", "backend": " Local ",
+    }))
+
+    assert len(approval_calls) == 1
+    assert approval_calls[0]["tool_name"] == "read_file"
+    assert result["error"] == "approval required"
+
+
+def test_file_handler_propagates_pending_approval_metadata(monkeypatch):
+    """Queued approvals keep structured fields for gateway/client handling."""
+    def fake_check(tool_name=None, operation=None, path=None):
+        return {
+            "approved": False,
+            "error": "Asking user for approval",
+            "status": "pending_approval",
+            "pattern_key": "file_backend_local",
+            "description": "Local file read requires approval",
+            "command": "read_file --backend local /etc/shadow",
+        }
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    from tools import approval as approval_mod
+    monkeypatch.setattr(approval_mod, "check_file_operation_approval", fake_check)
+
+    result = json.loads(file_tools._handle_read_file({
+        "path": "/etc/shadow", "backend": "local",
+    }))
+
+    assert result["approved"] is False
+    assert result["status"] == "pending_approval"
+    assert result["pattern_key"] == "file_backend_local"
+    assert result["description"] == "Local file read requires approval"
+    assert result["command"] == "read_file --backend local /etc/shadow"
+
+
+def test_resolve_path_for_task_uses_selected_backend_cwd(monkeypatch):
+    """Relative path guards/bookkeeping resolve against the selected backend."""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", "/configured-docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_CWD", "/configured-docker-specific")
+
+    docker_env = FakeEnvironment("docker")
+    docker_env.cwd = "/docker-live"
+    local_env = FakeEnvironment("local")
+    local_env.cwd = "/local-live"
+    terminal_tool._active_environments[("default", "docker")] = docker_env
+    terminal_tool._active_environments[("default", "local")] = local_env
+
+    assert str(file_tools._resolve_path_for_task("relative.txt", "default", backend="docker")) == "/docker-live/relative.txt"
+    assert str(file_tools._resolve_path_for_task("relative.txt", "default", backend=" local ")) == "/local-live/relative.txt"
+
+
+def test_docker_cwd_tilde_and_invalid_paths_are_container_sanitized(monkeypatch):
+    """docker_cwd is a container path, never host-expanded."""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", "/workspace")
+
+    monkeypatch.setenv("TERMINAL_DOCKER_CWD", "~")
+    assert terminal_tool._get_env_config()["docker_cwd"] == "/root"
+
+    monkeypatch.setenv("TERMINAL_DOCKER_CWD", "~/proj")
+    assert terminal_tool._get_env_config()["docker_cwd"] == "/root/proj"
+
+    monkeypatch.setenv("TERMINAL_DOCKER_CWD", "relative/path")
+    assert terminal_tool._get_env_config()["docker_cwd"] == ""
+
+    monkeypatch.setenv("TERMINAL_DOCKER_CWD", "/home/alice/project")
+    assert terminal_tool._get_env_config()["docker_cwd"] == ""
+
 def test_check_file_operation_approval_yolo_bypass(monkeypatch):
     """check_file_operation_approval auto-approves when YOLO mode is active."""
     from tools import approval as approval_mod
