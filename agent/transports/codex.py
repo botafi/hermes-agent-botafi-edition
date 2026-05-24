@@ -143,24 +143,11 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
-        if is_codex_backend:
-            prompt_cache_key = kwargs.get("prompt_cache_key")
-            cache_scope_id = str(prompt_cache_key or session_id or "").strip()
-            if cache_scope_id:
-                existing_extra_headers = kwargs.get("extra_headers")
-                merged_extra_headers: Dict[str, str] = {}
-                if isinstance(existing_extra_headers, dict):
-                    merged_extra_headers.update(
-                        {
-                            str(key): str(value)
-                            for key, value in existing_extra_headers.items()
-                            if key and value is not None
-                        }
-                    )
-                merged_extra_headers["session_id"] = cache_scope_id
-                merged_extra_headers["x-client-request-id"] = cache_scope_id
-                kwargs["extra_headers"] = merged_extra_headers
-
+        # The chatgpt.com/backend-api/codex Responses surface now rejects
+        # `extra_headers` when it appears in the serialized request body
+        # (HTTP 400: Unsupported parameter). Keep cache affinity on the
+        # body-supported prompt_cache_key only; do not inject the legacy
+        # session_id / x-client-request-id headers for this backend.
         max_tokens = params.get("max_tokens")
         if max_tokens is not None and not is_codex_backend:
             kwargs["max_output_tokens"] = max_tokens
