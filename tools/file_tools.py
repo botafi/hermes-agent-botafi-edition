@@ -103,10 +103,16 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
             return live_cwd
 
     try:
-        from tools.terminal_tool import _active_environments, _env_lock
+        from tools.terminal_tool import _active_environments, _env_lock, _get_env_config
 
+        env_type = _get_env_config()["env_type"]
+        env_key = (container_key, env_type)
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = (
+                _active_environments.get(env_key)
+                or _active_environments.get(container_key)
+                or _active_environments.get(task_id)
+            )
             live_cwd = getattr(env, "cwd", None) if env is not None else None
         if live_cwd:
             return live_cwd
@@ -479,32 +485,41 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     import time
 
     task_id = _resolve_container_task_id(task_id)
+    config = _get_env_config()
+    env_type = config["env_type"]
+    env_key = (task_id, env_type)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
     with _file_ops_lock:
-        cached = _file_ops_cache.get(task_id)
+        cached = _file_ops_cache.get(env_key) or _file_ops_cache.get(task_id)
     if cached is not None:
         with _env_lock:
+            if env_key in _active_environments:
+                _last_activity[env_key] = time.time()
+                return cached
             if task_id in _active_environments:
                 _last_activity[task_id] = time.time()
                 return cached
-            else:
-                # Environment was cleaned up -- invalidate stale cache entry
-                with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+            # Environment was cleaned up -- invalidate stale cache entry
+            with _file_ops_lock:
+                _file_ops_cache.pop(env_key, None)
+                _file_ops_cache.pop(task_id, None)
 
     # Need to ensure the environment exists before building file_ops.
-    # Acquire per-task lock so only one thread creates the sandbox.
+    # Acquire per-task/backend lock so only one thread creates the sandbox.
     with _creation_locks_lock:
-        if task_id not in _creation_locks:
-            _creation_locks[task_id] = threading.Lock()
-        task_lock = _creation_locks[task_id]
+        if env_key not in _creation_locks:
+            _creation_locks[env_key] = threading.Lock()
+        task_lock = _creation_locks[env_key]
 
     with task_lock:
         # Double-check: another thread may have created it while we waited
         with _env_lock:
-            if task_id in _active_environments:
+            if env_key in _active_environments:
+                _last_activity[env_key] = time.time()
+                terminal_env = _active_environments[env_key]
+            elif task_id in _active_environments:
                 _last_activity[task_id] = time.time()
                 terminal_env = _active_environments[task_id]
             else:
@@ -513,8 +528,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         if terminal_env is None:
             from tools.terminal_tool import _task_env_overrides
 
-            config = _get_env_config()
-            env_type = config["env_type"]
             overrides = _task_env_overrides.get(task_id, {})
 
             if env_type == "docker":
@@ -573,8 +586,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             )
 
             with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
+                _active_environments[env_key] = terminal_env
+                _last_activity[env_key] = time.time()
 
             _start_cleanup_thread()
             logger.info("%s environment ready for task %s", env_type, task_id[:8])
@@ -582,7 +595,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     # Build file_ops from the (guaranteed live) environment and cache it
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
-        _file_ops_cache[task_id] = file_ops
+        _file_ops_cache[env_key] = file_ops
     return file_ops
 
 
@@ -590,7 +603,12 @@ def clear_file_ops_cache(task_id: str = None):
     """Clear the file operations cache."""
     with _file_ops_lock:
         if task_id:
-            _file_ops_cache.pop(task_id, None)
+            keys_to_remove = [
+                key for key in _file_ops_cache
+                if (key[0] if isinstance(key, tuple) else key) == task_id
+            ]
+            for key in keys_to_remove:
+                _file_ops_cache.pop(key, None)
         else:
             _file_ops_cache.clear()
 
