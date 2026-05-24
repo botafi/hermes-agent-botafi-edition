@@ -1067,6 +1067,10 @@ def _get_env_config() -> Dict[str, Any]:
                         cwd, env_type, default_cwd)
             cwd = default_cwd
 
+    docker_cwd = os.getenv("TERMINAL_DOCKER_CWD", "")
+    if docker_cwd:
+        docker_cwd = os.path.expanduser(docker_cwd)
+
     return {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
@@ -1077,6 +1081,7 @@ def _get_env_config() -> Dict[str, Any]:
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
         "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
+        "docker_cwd": docker_cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
@@ -1819,6 +1824,8 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
+        if effective_env_type == "docker" and config.get("docker_cwd") and not overrides.get("cwd"):
+            cwd = config["docker_cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 

@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from typing import Optional
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
@@ -339,7 +340,59 @@ def _is_internal_file_status_text(content: str) -> bool:
     return False
 
 
-def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
+_ALLOWED_FILE_BACKENDS = {"local", "docker"}
+
+
+def _check_local_file_operation_approval(
+    backend: Optional[str],
+    tool_name: str,
+    operation: str,
+    path: str,
+    task_id: str = "default",
+) -> dict:
+    """Check whether a local file operation needs approval when Docker is the default backend.
+
+    When the configured backend is Docker and the caller explicitly requests
+    backend="local", the local file operation must be approval-gated to prevent
+    silent sandbox escape. Returns {"approved": True} when safe or
+    {"approved": False, "error": "..."} when denied.
+    """
+    from tools.terminal_tool import _get_env_config
+
+    if backend is not None:
+        backend_value = backend.strip().lower() if isinstance(backend, str) else backend
+        if backend_value not in _ALLOWED_FILE_BACKENDS:
+            return {
+                "approved": False,
+                "error": (
+                    f"Invalid backend: {backend!r}. "
+                    f"Supported values: {', '.join(sorted(_ALLOWED_FILE_BACKENDS))}"
+                ),
+            }
+
+    config = _get_env_config()
+    configured_backend = config.get("env_type", "local")
+
+    if configured_backend != "docker":
+        return {"approved": True}
+
+    if backend != "local":
+        return {"approved": True}
+
+    return {
+        "approved": False,
+        "error": (
+            f"Local file {operation} blocked: the configured terminal backend is "
+            f"docker, but {tool_name} requested backend='local'. This is a sandbox "
+            f"escape attempt. To allow local file operations while using Docker as "
+            f"the default terminal backend, set approvals.file_local_override to "
+            f"'allow' in config.yaml or use terminal(backend='local') to interact "
+            f"with the local filesystem directly."
+        ),
+    }
+
+
+def _get_file_ops(task_id: str = "default", backend: Optional[str] = None) -> ShellFileOperations:
     """Get or create ShellFileOperations for a terminal environment.
 
     Respects the TERMINAL_ENV setting -- if the task_id doesn't have an
@@ -365,7 +418,19 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
     task_id = _resolve_container_task_id(task_id)
     config = _get_env_config()
-    env_type = config["env_type"]
+    configured_env_type = config["env_type"]
+
+    if backend is not None:
+        backend_value = backend.strip().lower() if isinstance(backend, str) else backend
+        if backend_value not in _ALLOWED_FILE_BACKENDS:
+            raise ValueError(
+                f"Invalid backend: {backend!r}. "
+                f"Supported values: {', '.join(sorted(_ALLOWED_FILE_BACKENDS))}"
+            )
+        env_type = backend_value
+    else:
+        env_type = configured_env_type
+
     env_key = (task_id, env_type)
 
     # Fast path: check cache -- but also verify the underlying environment
@@ -421,6 +486,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = ""
 
             cwd = overrides.get("cwd") or config["cwd"]
+            if env_type == "docker" and config.get("docker_cwd") and not overrides.get("cwd"):
+                cwd = config["docker_cwd"]
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
@@ -493,7 +560,8 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default",
+                    backend: Optional[str] = None) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -594,7 +662,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(task_id, backend=backend)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
@@ -845,7 +913,8 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
-                    cross_profile: bool = False) -> str:
+                    cross_profile: bool = False,
+                    backend: Optional[str] = None) -> str:
     """Write content to a file.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
@@ -877,7 +946,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
+            file_ops = _get_file_ops(task_id, backend=backend)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
@@ -893,7 +962,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
+            file_ops = _get_file_ops(task_id, backend=backend)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning
@@ -915,7 +984,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default", cross_profile: bool = False) -> str:
+               task_id: str = "default", cross_profile: bool = False,
+               backend: Optional[str] = None) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
@@ -977,7 +1047,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _sw:
                     stale_warnings.append(_sw)
 
-            file_ops = _get_file_ops(task_id)
+            file_ops = _get_file_ops(task_id, backend=backend)
 
             if mode == "replace":
                 if not path:
@@ -1021,7 +1091,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
-                task_id: str = "default") -> str:
+                task_id: str = "default",
+                backend: Optional[str] = None) -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
@@ -1060,7 +1131,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(task_id, backend=backend)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
@@ -1109,7 +1180,8 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000},
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["path"]
     }
@@ -1128,6 +1200,7 @@ WRITE_FILE_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["path", "content"]
     }
@@ -1179,6 +1252,7 @@ PATCH_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
                 "default": False,
             },
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["mode"],
     },
@@ -1197,7 +1271,8 @@ SEARCH_FILES_SCHEMA = {
             "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
             "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0},
+            "backend": {"type": "string", "enum": ["local", "docker"], "description": "Override terminal backend for this file operation. Defaults to the configured terminal.backend. Use 'docker' for sandboxed filesystem or 'local' for host filesystem access (approval-gated when default is Docker)."}
         },
         "required": ["pattern"]
     }
@@ -1206,11 +1281,27 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    backend = args.get("backend")
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="read_file", operation="read",
+            path=args.get("path", ""), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return tool_error(approval.get("error", "Local file operation denied."))
+    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid, backend=backend)
 
 
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
+    backend = args.get("backend")
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="write_file", operation="write",
+            path=args.get("path", ""), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return tool_error(approval.get("error", "Local file operation denied."))
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
             "write_file: missing required field 'path'. Re-emit the tool call with "
@@ -1232,28 +1323,47 @@ def _handle_write_file(args, **kw):
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        backend=backend,
     )
 
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    backend = args.get("backend")
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="patch", operation="patch",
+            path=args.get("path", ""), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return tool_error(approval.get("error", "Local file operation denied."))
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        backend=backend,
     )
 
 
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
+    backend = args.get("backend")
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="search_files", operation="search",
+            path=args.get("path", "."), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return tool_error(approval.get("error", "Local file operation denied."))
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid,
+        backend=backend)
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
