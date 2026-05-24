@@ -1355,3 +1355,141 @@ def test_file_approval_full_session_lifecycle(monkeypatch):
         assert not r.get("user_approved"), f"{tool_name} should be cached"
 
     approval_mod.clear_session(session_key)
+
+
+# ── Stage 2: session_all file backend approvals ────────────────────────
+
+
+def test_file_approval_session_all_covers_all_file_tools(monkeypatch):
+    """choice='session_all' persists under 'file:backend:local:any' and
+    auto-approves any subsequent file tool in the same session."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-session-all"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session_all")
+    t1.join(timeout=5)
+    assert not t1.is_alive()
+    assert holder1["result"]["approved"] is True
+    assert holder1["result"]["user_approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    for tool_name in ("read_file", "write_file", "patch", "search_files"):
+        token_x = approval_mod.set_current_session_key(session_key)
+        r = approval_mod.check_file_operation_approval(
+            tool_name=tool_name, operation="read", path="/any/path",
+        )
+        approval_mod.reset_current_session_key(token_x)
+        assert r["approved"] is True, f"{tool_name} should be covered by session_all"
+        assert not r.get("user_approved"), f"{tool_name} should be cached"
+
+    with approval_mod._lock:
+        perms = set(approval_mod._permanent_approved)
+    assert "file:backend:local:any" not in perms, (
+        "permanent allowlist must not contain file:backend:local:any"
+    )
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_all_does_not_leak_across_sessions(monkeypatch):
+    """session_all in session A does NOT auto-approve session B."""
+    from tools import approval as approval_mod
+
+    session_a = "gw-test-sa-sessions-a"
+    session_b = "gw-test-sa-sessions-b"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_a, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_a, "session_all")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_a)
+    approval_mod.reset_current_session_key(tok1)
+
+    t2, holder2, tok2 = _run_file_approval_in_thread(
+        approval_mod, session_b, "search_files", "search", "/var/log", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_b, "once")
+    t2.join(timeout=5)
+    assert holder2["result"]["approved"] is True
+    assert holder2["result"]["user_approved"] is True
+    approval_mod.unregister_gateway_notify(session_b)
+    approval_mod.reset_current_session_key(tok2)
+
+    approval_mod.clear_session(session_a)
+    approval_mod.clear_session(session_b)
+
+
+def test_file_approval_session_all_does_not_affect_dangerous_commands(monkeypatch):
+    """session_all must NOT auto-approve dangerous command patterns."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-sa-no-dc"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "write_file", "write", "/tmp/test.py", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session_all")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    with approval_mod._lock:
+        perms = set(approval_mod._permanent_approved)
+    assert len(perms) == 0, "session_all must not write to permanent allowlist"
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    token = approval_mod.set_current_session_key(session_key)
+    result = approval_mod.check_dangerous_command(
+        "rm -rf /tmp/some-test-dir", "local",
+    )
+    approval_mod.reset_current_session_key(token)
+
+    if not result.get("approved"):
+        assert "pattern_key" in result
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_all_key_is_umbrella_not_per_tool(monkeypatch):
+    """session_all persists 'file:backend:local:any', not per-tool keys."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-sa-umbrella"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session_all")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    with approval_mod._lock:
+        session_apps = approval_mod._session_approved.get(session_key, set())
+    assert "file:backend:local:any" in session_apps, (
+        "file:backend:local:any must be in session approvals"
+    )
+    assert "file:read_file" not in session_apps, (
+        "per-tool file:read_file must NOT be in session approvals"
+    )
+    assert "file:write_file" not in session_apps, (
+        "per-tool file:write_file must NOT be in session approvals"
+    )
+
+    approval_mod.clear_session(session_key)

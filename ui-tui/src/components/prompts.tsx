@@ -8,8 +8,8 @@ import type { ApprovalReq, ClarifyReq, ConfirmReq } from '../types.js'
 import { TextInput } from './textInput.js'
 
 const COMMAND_APPROVAL_OPTS = ['once', 'session', 'always', 'deny'] as const
-const FILE_APPROVAL_OPTS = ['once', 'session', 'deny'] as const
-const LABELS = { always: 'Always allow', deny: 'Deny', once: 'Allow once', session: 'Allow this session' } as const
+const FILE_APPROVAL_OPTS = ['once', 'session', 'session_all', 'deny'] as const
+const LABELS = { always: 'Always allow', deny: 'Deny', once: 'Allow once', session: 'Allow this session', session_all: 'Allow all file tools for session' } as const
 const CMD_PREVIEW_LINES = 10
 
 type ApprovalKey = {
@@ -19,12 +19,12 @@ type ApprovalKey = {
   upArrow?: boolean
 }
 
+type ApprovalOption = (typeof COMMAND_APPROVAL_OPTS)[number] | (typeof FILE_APPROVAL_OPTS)[number]
+
 type ApprovalAction =
-  | { kind: 'choose'; choice: (typeof COMMAND_APPROVAL_OPTS)[number] }
+  | { kind: 'choose'; choice: ApprovalOption }
   | { kind: 'move'; delta: -1 | 1 }
   | { kind: 'noop' }
-
-type ApprovalOption = (typeof COMMAND_APPROVAL_OPTS)[number]
 
 export function approvalOptions(req?: Pick<ApprovalReq, 'approval_kind' | 'pattern_key'>): readonly ApprovalOption[] {
   if (req?.approval_kind === 'file_backend_local' || req?.pattern_key?.startsWith('file:')) {

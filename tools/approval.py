@@ -1450,6 +1450,10 @@ def check_file_operation_approval(
 
     session_key = get_current_session_key()
 
+    # Check if the session_all umbrella approval is active (Stage 2).
+    if is_approved(session_key, "file:backend:local:any"):
+        return {"approved": True}
+
     # Check if this file tool is already session-approved.
     file_pattern_key = f"file:{tool_name}"
     if is_approved(session_key, file_pattern_key):
@@ -1571,7 +1575,10 @@ def check_file_operation_approval(
             # Persist session-level approval.  "always" is demoted to
             # session-only for file local-backend approvals so stale
             # clients cannot silently persist permanent entries.
-            if choice in ("session", "always"):
+            # "session_all" covers all file tools under the umbrella key.
+            if choice == "session_all":
+                approve_session(session_key, "file:backend:local:any")
+            elif choice in ("session", "always"):
                 approve_session(session_key, file_pattern_key)
 
             return {"approved": True, "user_approved": True}

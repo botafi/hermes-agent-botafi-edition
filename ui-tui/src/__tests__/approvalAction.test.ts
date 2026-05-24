@@ -51,14 +51,15 @@ describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
   it('omits always for file local-backend approval options', () => {
     const opts = approvalOptions({ approval_kind: 'file_backend_local' })
 
-    expect(opts).toEqual(['once', 'session', 'deny'])
+    expect(opts).toEqual(['once', 'session', 'session_all', 'deny'])
     expect(approvalAction('1', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'once' })
     expect(approvalAction('2', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'session' })
-    expect(approvalAction('3', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'deny' })
-    expect(approvalAction('4', {}, 0, opts)).toEqual({ kind: 'noop' })
+    expect(approvalAction('3', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'session_all' })
+    expect(approvalAction('4', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'deny' })
+    expect(approvalAction('5', {}, 0, opts)).toEqual({ kind: 'noop' })
   })
 
   it('omits always for legacy file pattern-key approval payloads', () => {
-    expect(approvalOptions({ pattern_key: 'file:read_file' })).toEqual(['once', 'session', 'deny'])
+    expect(approvalOptions({ pattern_key: 'file:read_file' })).toEqual(['once', 'session', 'session_all', 'deny'])
   })
 })
