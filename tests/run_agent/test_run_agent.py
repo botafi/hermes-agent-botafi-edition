@@ -1275,6 +1275,41 @@ class TestBuildApiKwargs:
         assert kwargs["messages"] is messages
         assert kwargs["timeout"] == 1800.0
 
+    def test_non_stream_stale_timeout_counts_large_responses_payload(self, agent, monkeypatch):
+        monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *_args, **_kwargs: None)
+        monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+        api_kwargs = {
+            "model": "gpt-5.5",
+            "instructions": "i" * 80_000,
+            "input": [{"role": "user", "content": "u" * 120_000}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "terminal",
+                    "description": "t" * 20_000,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "p" * 4_000}
+                        },
+                    },
+                }
+            ],
+            "store": False,
+        }
+
+        assert agent._compute_non_stream_stale_timeout(api_kwargs) == 450.0
+
+    def test_non_stream_stale_timeout_keeps_chat_messages_estimate(self, agent, monkeypatch):
+        monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *_args, **_kwargs: None)
+        monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+        messages = [{"role": "user", "content": "x" * 220_000}]
+
+        legacy_timeout = agent._compute_non_stream_stale_timeout(messages)
+
+        assert legacy_timeout == 450.0
+        assert agent._compute_non_stream_stale_timeout({"messages": messages}) == legacy_timeout
+
     def test_public_moonshot_kimi_k2_5_omits_temperature(self, agent):
         """Kimi models should NOT have client-side temperature overrides.
 

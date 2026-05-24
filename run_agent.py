@@ -100,6 +100,52 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
+def _estimate_non_stream_request_context_tokens(api_payload: Any) -> int:
+    """Estimate request context/load tokens from API kwargs or legacy messages.
+
+    The stale-call detector historically accepted a Chat Completions
+    ``messages`` list and used a cheap character/4 estimate.  Responses API
+    requests carry their conversational payload in ``input`` with additional
+    load in ``instructions`` and ``tools``, so estimate those fields when a
+    full kwargs dict is available.
+    """
+
+    def _chars(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            return len(value)
+        return len(str(value))
+
+    def _message_chars(messages: Any) -> int:
+        if not isinstance(messages, list):
+            return _chars(messages)
+        return sum(_chars(item) for item in messages)
+
+    if isinstance(api_payload, list):
+        return _message_chars(api_payload) // 4
+
+    if isinstance(api_payload, dict):
+        messages = api_payload.get("messages")
+        if isinstance(messages, list):
+            total_chars = _message_chars(messages)
+            if "tools" in api_payload:
+                total_chars += _chars(api_payload.get("tools"))
+            return total_chars // 4
+
+        if "input" in api_payload:
+            total_chars = (
+                _chars(api_payload.get("input"))
+                + _chars(api_payload.get("instructions"))
+                + _chars(api_payload.get("tools"))
+            )
+            return total_chars // 4
+
+        return sum(_chars(value) for value in api_payload.values()) // 4
+
+    return _chars(api_payload) // 4
+
+
 # Import our tool system
 from model_tools import (
     get_tool_definitions,
@@ -901,14 +947,14 @@ class AIAgent:
 
         return 300.0, True
 
-    def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+    def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        est_tokens = sum(len(str(v)) for v in messages) // 4
+        est_tokens = _estimate_non_stream_request_context_tokens(api_payload)
         if est_tokens > 100_000:
             return max(stale_base, 600.0)
         if est_tokens > 50_000:

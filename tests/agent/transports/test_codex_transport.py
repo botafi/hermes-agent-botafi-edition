@@ -146,6 +146,16 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("max_output_tokens") == 4096
 
+    def test_timeout(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            timeout=123.5,
+        )
+        assert kw["timeout"] == 123.5
+
     def test_codex_backend_no_max_output_tokens(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
