@@ -43,7 +43,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple, Union
 
 from utils import env_var_enabled
 
@@ -853,13 +853,26 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 """
 
 # Global state for environment lifecycle management
-_active_environments: Dict[str, Any] = {}
-_last_activity: Dict[str, float] = {}
+# Keys are (task_id, backend) tuples — one sandbox per (task, backend) pair.
+# Some tests and third-party callers may still seed legacy string keys directly;
+# helper functions below keep lifecycle operations backward-compatible.
+_ENV_CACHE_KEY = Tuple[str, str]
+_ENV_CACHE_DICT_KEY = Union[str, _ENV_CACHE_KEY]
+_active_environments: Dict[_ENV_CACHE_DICT_KEY, Any] = {}
+_last_activity: Dict[_ENV_CACHE_DICT_KEY, float] = {}
 _env_lock = threading.Lock()
-_creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
+_creation_locks: Dict[_ENV_CACHE_DICT_KEY, threading.Lock] = {}  # Per-(task,backend) locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
 _cleanup_running = False
+
+
+def _cache_key_task_id(cache_key: _ENV_CACHE_DICT_KEY) -> str:
+    return cache_key[0] if isinstance(cache_key, tuple) else cache_key
+
+
+def _cache_key_backend(cache_key: _ENV_CACHE_DICT_KEY) -> str:
+    return cache_key[1] if isinstance(cache_key, tuple) else "legacy"
 
 # Per-task environment overrides registry.
 # Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal
@@ -1186,9 +1199,9 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # background processes (their _last_activity gets refreshed to keep them alive).
     try:
         from tools.process_registry import process_registry
-        for task_id in list(_last_activity.keys()):
-            if process_registry.has_active_processes(task_id):
-                _last_activity[task_id] = current_time  # Keep sandbox alive
+        for cache_key in list(_last_activity.keys()):
+            if process_registry.has_active_processes(_cache_key_task_id(cache_key)):
+                _last_activity[cache_key] = current_time  # Keep sandbox alive
     except ImportError:
         pass
 
@@ -1196,29 +1209,31 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # holding the lock.  Do NOT call env.cleanup() inside the lock -- Modal and
     # Docker teardown can block for 10-15s, which would stall every concurrent
     # terminal/file tool call waiting on _env_lock.
-    envs_to_stop = []  # list of (task_id, env) pairs
+    envs_to_stop: list[tuple[_ENV_CACHE_DICT_KEY, Any]] = []
 
     with _env_lock:
-        for task_id, last_time in list(_last_activity.items()):
+        for cache_key, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
-                env = _active_environments.pop(task_id, None)
-                _last_activity.pop(task_id, None)
+                env = _active_environments.pop(cache_key, None)
+                _last_activity.pop(cache_key, None)
                 if env is not None:
-                    envs_to_stop.append((task_id, env))
+                    envs_to_stop.append((cache_key, env))
 
-        # Also purge per-task creation locks for cleaned-up tasks
+        # Also purge per-(task,backend) creation locks for cleaned-up keys
         with _creation_locks_lock:
-            for task_id, _ in envs_to_stop:
-                _creation_locks.pop(task_id, None)
+            for cache_key, _ in envs_to_stop:
+                _creation_locks.pop(cache_key, None)
 
     # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
     # are not blocked while Modal/Docker sandboxes shut down.
-    for task_id, env in envs_to_stop:
+    for cache_key, env in envs_to_stop:
+        task_for_cache = _cache_key_task_id(cache_key)
+        backend_for_log = _cache_key_backend(cache_key)
         # Invalidate stale file_ops cache entry (Bug fix: prevents
         # ShellFileOperations from referencing a dead sandbox)
         try:
             from tools.file_tools import clear_file_ops_cache
-            clear_file_ops_cache(task_id)
+            clear_file_ops_cache(task_for_cache)
         except ImportError:
             pass
 
@@ -1230,14 +1245,14 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
             elif hasattr(env, 'terminate'):
                 env.terminate()
 
-            logger.info("Cleaned up inactive environment for task: %s", task_id)
+            logger.info("Cleaned up inactive environment for task: %s (backend: %s)", task_for_cache, backend_for_log)
 
         except Exception as e:
             error_str = str(e)
             if "404" in error_str or "not found" in error_str.lower():
-                logger.info("Environment for task %s already cleaned up", task_id)
+                logger.info("Environment for task %s (backend: %s) already cleaned up", task_for_cache, backend_for_log)
             else:
-                logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+                logger.warning("Error cleaning up environment for task %s (backend: %s): %s", task_for_cache, backend_for_log, e)
 
 
 def _cleanup_thread_worker():
@@ -1277,14 +1292,27 @@ def _stop_cleanup_thread():
             pass
 
 
-def get_active_env(task_id: str):
-    """Return the active BaseEnvironment for *task_id*, or None."""
+def get_active_env(task_id: str, backend: Optional[str] = None):
+    """Return the active BaseEnvironment for *task_id* (+ optional *backend*), or None.
+
+    When *backend* is None (backward-compatible call), returns any active
+    environment for *task_id*, matching the first one found.
+    When *backend* is provided, returns only the environment for that
+    specific (task_id, backend) pair.
+    """
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        if backend is not None:
+            cache_key = (lookup, backend)
+            return _active_environments.get(cache_key)
+        # Backward compat: search for any backend matching this task_id
+        for cache_key, env in _active_environments.items():
+            if _cache_key_task_id(cache_key) == lookup:
+                return env
+        return None
 
 
-def is_persistent_env(task_id: str) -> bool:
+def is_persistent_env(task_id: str, backend: Optional[str] = None) -> bool:
     """Return True if the active environment for task_id is configured for
     cross-turn persistence (``persistent_filesystem=True``).
 
@@ -1295,7 +1323,7 @@ def is_persistent_env(task_id: str) -> bool:
     (``_cleanup_inactive_envs``) handles persistent envs once they exceed
     ``terminal.lifetime_seconds``.
     """
-    env = get_active_env(task_id)
+    env = get_active_env(task_id, backend=backend)
     if env is None:
         return False
     return bool(getattr(env, "_persistent", False))
@@ -1305,15 +1333,16 @@ def is_persistent_env(task_id: str) -> bool:
 
 def cleanup_all_environments():
     """Clean up ALL active environments. Use with caution."""
-    task_ids = list(_active_environments.keys())
+    with _env_lock:
+        keys = list(_active_environments.keys())
     cleaned = 0
     
-    for task_id in task_ids:
+    for cache_key in keys:
         try:
-            cleanup_vm(task_id)
+            cleanup_vm(cache_key)
             cleaned += 1
         except Exception as e:
-            logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
+            logger.error("Error cleaning %s: %s", cache_key, e, exc_info=True)
     
     # Also clean any orphaned directories
     scratch_dir = _get_scratch_dir()
@@ -1330,46 +1359,75 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str):
-    """Manually clean up a specific environment by task_id."""
-    # Remove from tracking dicts while holding the lock, but defer the
-    # actual (potentially slow) env.cleanup() call to outside the lock
-    # so other tool calls aren't blocked.
-    env = None
-    with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+def cleanup_vm(task_id: Union[str, _ENV_CACHE_KEY], backend: Optional[str] = None):
+    """Manually clean up a specific environment by task_id.
 
-    # Clean up per-task creation lock
-    with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+    When *task_id* is a string and *backend* is None (backward compat):
+    cleans up ALL environments matching that task_id.
 
-    # Invalidate stale file_ops cache entry
-    try:
-        from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
-    except ImportError:
-        pass
+    When *task_id* is a string and *backend* is provided: cleans up only
+    the environment for that (task_id, backend) pair.
 
-    if env is None:
-        return
+    When *task_id* is a tuple: cleans up that exact cache key directly
+    (used internally by cleanup loops).
+    """
+    # Resolve the list of keys to clean up.
+    if isinstance(task_id, tuple):
+        keys_to_clean = [task_id]
+    elif backend is not None:
+        lookup = _resolve_container_task_id(task_id)
+        keys_to_clean = [(lookup, backend)]
+    else:
+        # Backward compat: clean all backends for this task_id
+        lookup = _resolve_container_task_id(task_id)
+        with _env_lock:
+            keys_to_clean = [
+                k for k in _active_environments if _cache_key_task_id(k) == lookup
+            ]
+        if not keys_to_clean:
+            keys_to_clean = [task_id]
 
-    try:
-        if hasattr(env, 'cleanup'):
-            env.cleanup()
-        elif hasattr(env, 'stop'):
-            env.stop()
-        elif hasattr(env, 'terminate'):
-            env.terminate()
+    for cache_key in keys_to_clean:
+        # Remove from tracking dicts while holding the lock, but defer the
+        # actual (potentially slow) env.cleanup() call to outside the lock
+        # so other tool calls aren't blocked.
+        env = None
+        with _env_lock:
+            env = _active_environments.pop(cache_key, None)
+            _last_activity.pop(cache_key, None)
 
-        logger.info("Manually cleaned up environment for task: %s", task_id)
+        # Clean up per-(task,backend) creation lock
+        with _creation_locks_lock:
+            _creation_locks.pop(cache_key, None)
 
-    except Exception as e:
-        error_str = str(e)
-        if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
-        else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+        # Invalidate stale file_ops cache entry
+        task_for_cache = _cache_key_task_id(cache_key)
+        backend_for_log = _cache_key_backend(cache_key)
+        try:
+            from tools.file_tools import clear_file_ops_cache
+            clear_file_ops_cache(task_for_cache)
+        except ImportError:
+            pass
+
+        if env is None:
+            continue
+
+        try:
+            if hasattr(env, 'cleanup'):
+                env.cleanup()
+            elif hasattr(env, 'stop'):
+                env.stop()
+            elif hasattr(env, 'terminate'):
+                env.terminate()
+
+            logger.info("Manually cleaned up environment for task: %s (backend: %s)", task_for_cache, backend_for_log)
+
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                logger.info("Environment for task %s (backend: %s) already cleaned up", task_for_cache, backend_for_log)
+            else:
+                logger.warning("Error cleaning up environment for task %s (backend: %s): %s", task_for_cache, backend_for_log, e)
 
 
 def _atexit_cleanup():
@@ -1590,6 +1648,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    backend: Optional[str] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -1604,6 +1663,7 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        backend: Override terminal backend for this call. Supported: "local", "docker". Defaults to TERMINAL_ENV config.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -1617,7 +1677,7 @@ def terminal_tool(
 
         # With custom timeout
         >>> result = terminal_tool(command="long_task.sh", timeout=300)
-        
+
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
@@ -1638,24 +1698,46 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
+        # Resolve effective backend: caller-supplied backend overrides
+        # TERMINAL_ENV, validated against the known set exposed to the model.
+        valid_backend_overrides = frozenset(("local", "docker"))
+        if backend is not None:
+            backend_value = backend.strip().lower() if isinstance(backend, str) else backend
+            if backend_value not in valid_backend_overrides:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        f"Invalid backend: {backend!r}. "
+                        f"Supported values: {', '.join(sorted(valid_backend_overrides))}"
+                    ),
+                    "status": "error",
+                }, ensure_ascii=False)
+            effective_env_type = backend_value
+        else:
+            effective_env_type = env_type
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
 
+        # Build cache key now that task and backend are resolved.
+        env_cache_key = (effective_task_id, effective_env_type)
+
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config
         overrides = _task_env_overrides.get(effective_task_id, {})
         
         # Select image based on env type, with per-task override support
-        if env_type == "docker":
+        if effective_env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
-        elif env_type == "singularity":
+        elif effective_env_type == "singularity":
             image = overrides.get("singularity_image") or config["singularity_image"]
-        elif env_type == "modal":
+        elif effective_env_type == "modal":
             image = overrides.get("modal_image") or config["modal_image"]
-        elif env_type == "daytona":
+        elif effective_env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
         else:
             image = ""
@@ -1691,11 +1773,17 @@ def terminal_tool(
         _start_cleanup_thread()
 
         # Get or create environment.
-        # Use a per-task creation lock so concurrent tool calls for the same
-        # task_id wait for the first one to finish creating the sandbox,
-        # instead of each creating their own (wasting Modal resources).
+        # Use a per-(task,backend) creation lock so concurrent tool calls for
+        # the same key wait for the first one to finish creating the sandbox,
+        # instead of each creating their own (wasting resources).
         with _env_lock:
-            if effective_task_id in _active_environments:
+            if env_cache_key in _active_environments:
+                _last_activity[env_cache_key] = time.time()
+                env = _active_environments[env_cache_key]
+                needs_creation = False
+            elif effective_task_id in _active_environments:
+                # Backward compatibility for tests/extensions that pre-seed
+                # the environment cache with the historical string task_id key.
                 _last_activity[effective_task_id] = time.time()
                 env = _active_environments[effective_task_id]
                 needs_creation = False
@@ -1703,27 +1791,31 @@ def terminal_tool(
                 needs_creation = True
 
         if needs_creation:
-            # Per-task lock: only one thread creates the sandbox, others wait
+            # Per-(task,backend) lock: only one thread creates the sandbox, others wait
             with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
+                if env_cache_key not in _creation_locks:
+                    _creation_locks[env_cache_key] = threading.Lock()
+                task_lock = _creation_locks[env_cache_key]
 
             with task_lock:
-                # Double-check after acquiring the per-task lock
+                # Double-check after acquiring the per-key lock
                 with _env_lock:
-                    if effective_task_id in _active_environments:
+                    if env_cache_key in _active_environments:
+                        _last_activity[env_cache_key] = time.time()
+                        env = _active_environments[env_cache_key]
+                        needs_creation = False
+                    elif effective_task_id in _active_environments:
                         _last_activity[effective_task_id] = time.time()
                         env = _active_environments[effective_task_id]
                         needs_creation = False
 
                 if needs_creation:
-                    if env_type == "singularity":
+                    if effective_env_type == "singularity":
                         _check_disk_usage_warning()
-                    logger.info("Creating new %s environment for task %s...", env_type, effective_task_id[:8])
+                    logger.info("Creating new %s environment for task %s...", effective_env_type, effective_task_id[:8])
                     try:
                         ssh_config = None
-                        if env_type == "ssh":
+                        if effective_env_type == "ssh":
                             ssh_config = {
                                 "host": config.get("ssh_host", ""),
                                 "user": config.get("ssh_user", ""),
@@ -1733,7 +1825,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona"}:
+                        if effective_env_type in {"docker", "singularity", "modal", "daytona"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -1749,13 +1841,13 @@ def terminal_tool(
                             }
 
                         local_config = None
-                        if env_type == "local":
+                        if effective_env_type == "local":
                             local_config = {
                                 "persistent": config.get("local_persistent", False),
                             }
 
                         new_env = _create_environment(
-                            env_type=env_type,
+                            env_type=effective_env_type,
                             image=image,
                             cwd=cwd,
                             timeout=effective_timeout,
@@ -1774,16 +1866,16 @@ def terminal_tool(
                         }, ensure_ascii=False)
 
                     with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        _active_environments[env_cache_key] = new_env
+                        _last_activity[env_cache_key] = time.time()
                         env = new_env
-                    logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+                    logger.info("%s environment ready for task %s", effective_env_type, effective_task_id[:8])
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
-            approval = _check_all_guards(command, env_type)
+            approval = _check_all_guards(command, effective_env_type)
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
@@ -1852,7 +1944,7 @@ def terminal_tool(
             session_key = get_current_session_key(default="")
             effective_cwd = workdir or cwd
             try:
-                if env_type == "local":
+                if effective_env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
@@ -2084,12 +2176,12 @@ def terminal_tool(
                         retry_count += 1
                         wait_time = 2 ** retry_count
                         logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, effective_env_type)
                         time.sleep(wait_time)
                         continue
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, effective_env_type)
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
@@ -2104,7 +2196,7 @@ def terminal_tool(
             returncode = result.get("returncode", 0)
 
             # Add helpful message for sudo failures in messaging context
-            output = _handle_sudo_failure(output, env_type)
+            output = _handle_sudo_failure(output, effective_env_type)
 
             # Foreground terminal output canonicalization seam: plugins receive
             # the full output string before default truncation and may only
@@ -2118,7 +2210,7 @@ def terminal_tool(
                     output=output,
                     returncode=returncode,
                     task_id=effective_task_id or "",
-                    env_type=env_type,
+                    env_type=effective_env_type,
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
@@ -2378,6 +2470,11 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
+            },
+            "backend": {
+                "type": "string",
+                "enum": ["local", "docker"],
+                "description": "Override the configured terminal backend for this call. The default backend (from TERMINAL_ENV) is used when not set. Use 'docker' for isolated container execution or 'local' to run on the host."
             }
         },
         "required": ["command"]
@@ -2395,6 +2492,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        backend=args.get("backend"),
     )
 
 
