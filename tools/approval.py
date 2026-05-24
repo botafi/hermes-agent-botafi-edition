@@ -1563,12 +1563,13 @@ def check_file_operation_approval(
 
             return {"approved": True, "user_approved": True}
 
-        submit_pending(session_key, {
+        approval_payload = {
             "command": f"{tool_name}(path={path!r}, backend='local')",
             "pattern_key": f"file:{tool_name}",
             "pattern_keys": [f"file:{tool_name}"],
             "description": description,
-        })
+        }
+        submit_pending(session_key, approval_payload)
         return {
             "approved": False,
             "error": (
@@ -1578,6 +1579,7 @@ def check_file_operation_approval(
                 f"this operation."
             ),
             "status": "pending_approval",
+            **approval_payload,
         }
 
     return {

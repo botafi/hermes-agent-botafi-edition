@@ -150,6 +150,30 @@ def _get_live_tracking_cwd(task_id: str = "default", backend: Optional[str] = No
     return None
 
 
+def _get_live_tracking_home(task_id: str = "default", backend: Optional[str] = None) -> str | None:
+    """Return HOME for the selected backend when a live env is available."""
+    try:
+        from tools.terminal_tool import _resolve_container_task_id, _active_environments, _env_lock
+        container_key = _resolve_container_task_id(task_id)
+        normalized_backend = _normalize_file_backend(backend)
+        env_key = (container_key, normalized_backend) if normalized_backend is not None else None
+        with _env_lock:
+            env = _active_environments.get(env_key) if env_key is not None else None
+        if env is not None:
+            try:
+                result = env.execute("printf %s \"$HOME\"", timeout=5)
+                output = result.get("output") if isinstance(result, dict) else getattr(result, "stdout", "")
+                if output and str(output).strip():
+                    return str(output).strip()
+            except Exception:
+                pass
+        if normalized_backend == "docker":
+            return "/root"
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_path_for_task(filepath: str, task_id: str = "default",
                           backend: Optional[str] = None) -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible.
@@ -159,7 +183,28 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default",
     consistent with the environment that ``_get_file_ops(backend=...)``
     will operate against.
     """
-    p = Path(filepath).expanduser()
+    raw_path = str(filepath)
+    normalized_backend = _normalize_file_backend(backend)
+
+    # For backend overrides, `~` must be interpreted in the selected
+    # backend environment, not expanded with the host process home.
+    # ShellFileOperations expands ~ via `echo $HOME`; mirror that for
+    # guard/bookkeeping paths where we can do so cheaply.
+    if raw_path == "~" or raw_path.startswith("~/"):
+        if normalized_backend is not None:
+            home = _get_live_tracking_home(task_id, backend=normalized_backend)
+            if home:
+                suffix = "" if raw_path == "~" else raw_path[1:]
+                return (Path(home) / suffix.lstrip("/")).resolve()
+        p = Path(raw_path).expanduser()
+    elif normalized_backend is not None and raw_path.startswith("~"):
+        # Avoid host-side ~user expansion for container/local override
+        # bookkeeping; leave it unresolved rather than mapping to the
+        # wrong filesystem.
+        p = Path(raw_path)
+    else:
+        p = Path(raw_path).expanduser()
+
     if not p.is_absolute():
         base = _get_live_tracking_cwd(task_id, backend=backend) or os.environ.get(
             "TERMINAL_CWD", os.getcwd()
@@ -380,10 +425,16 @@ _ALLOWED_FILE_BACKENDS = {"local", "docker"}
 
 
 def _normalize_file_backend(backend: Optional[str]) -> Optional[str]:
-    """Normalize a file-tool backend override, preserving None."""
+    """Normalize a file-tool backend override, preserving None.
+
+    Tool schema validation should normally guarantee a string, but direct
+    handler calls and tests can pass arbitrary JSON-ish values.  Coerce
+    non-None values to strings so validation produces a clean tool error
+    instead of crashing on unhashable values such as dict/list.
+    """
     if backend is None:
         return None
-    return backend.strip().lower() if isinstance(backend, str) else backend
+    return str(backend).strip().lower()
 
 
 def _check_local_file_operation_approval(
@@ -1346,6 +1397,8 @@ def _handle_approval_denial(approval: dict) -> str:
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
     backend = _normalize_file_backend(args.get("backend"))
+    if not args.get("path") or not isinstance(args.get("path"), str):
+        return tool_error("read_file: missing required field 'path'.")
     if backend is not None:
         approval = _check_local_file_operation_approval(
             backend=backend, tool_name="read_file", operation="read",
@@ -1359,13 +1412,6 @@ def _handle_read_file(args, **kw):
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     backend = _normalize_file_backend(args.get("backend"))
-    if backend is not None:
-        approval = _check_local_file_operation_approval(
-            backend=backend, tool_name="write_file", operation="write",
-            path=args.get("path", ""), task_id=tid,
-        )
-        if not approval.get("approved"):
-            return _handle_approval_denial(approval)
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
             "write_file: missing required field 'path'. Re-emit the tool call with "
@@ -1379,6 +1425,13 @@ def _handle_write_file(args, **kw):
             "payload, or use execute_code with hermes_tools.write_file() for very "
             "large files."
         )
+    if backend is not None:
+        approval = _check_local_file_operation_approval(
+            backend=backend, tool_name="write_file", operation="write",
+            path=args.get("path", ""), task_id=tid,
+        )
+        if not approval.get("approved"):
+            return _handle_approval_denial(approval)
     if not isinstance(args["content"], str):
         return tool_error(
             f"write_file: 'content' must be a string, got "
@@ -1394,6 +1447,10 @@ def _handle_write_file(args, **kw):
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
     backend = _normalize_file_backend(args.get("backend"))
+    if args.get("mode", "replace") != "patch" and not args.get("path"):
+        return tool_error("patch: missing required field 'path'.")
+    if args.get("mode", "replace") == "patch" and not args.get("patch"):
+        return tool_error("patch: missing required field 'patch'.")
     if backend is not None:
         approval = _check_local_file_operation_approval(
             backend=backend, tool_name="patch", operation="patch",
@@ -1413,6 +1470,8 @@ def _handle_patch(args, **kw):
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
     backend = _normalize_file_backend(args.get("backend"))
+    if not args.get("pattern") or not isinstance(args.get("pattern"), str):
+        return tool_error("search_files: missing required field 'pattern'.")
     if backend is not None:
         approval = _check_local_file_operation_approval(
             backend=backend, tool_name="search_files", operation="search",

@@ -705,6 +705,81 @@ def test_docker_cwd_tilde_and_invalid_paths_are_container_sanitized(monkeypatch)
     monkeypatch.setenv("TERMINAL_DOCKER_CWD", "/home/alice/project")
     assert terminal_tool._get_env_config()["docker_cwd"] == ""
 
+
+def test_file_backend_non_string_returns_clean_error(monkeypatch):
+    """Direct handler calls with non-string backend values should not crash."""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    result = json.loads(file_tools._handle_read_file({
+        "path": "/tmp/example.txt", "backend": {"name": "local"},
+    }))
+
+    assert "error" in result
+    assert "invalid backend" in result["error"].lower()
+
+
+def test_resolve_path_for_task_uses_backend_home_for_tilde(monkeypatch):
+    """~ paths resolve with selected backend HOME, not host process HOME."""
+    class HomeEnvironment(FakeEnvironment):
+        def __init__(self, env_type, home):
+            super().__init__(env_type)
+            self.home = home
+
+        def execute(self, command, timeout=None, cwd=None, pty=False):
+            if "$HOME" in command:
+                return {"output": self.home, "returncode": 0}
+            return super().execute(command, timeout=timeout, cwd=cwd, pty=pty)
+
+    monkeypatch.setenv("HOME", "/host/home")
+    docker_env = HomeEnvironment("docker", "/container/home")
+    docker_env.cwd = "/container/cwd"
+    terminal_tool._active_environments[("default", "docker")] = docker_env
+
+    assert str(file_tools._resolve_path_for_task("~/secret.txt", "default", backend="docker")) == "/container/home/secret.txt"
+
+
+def test_handler_validates_args_before_local_approval(monkeypatch):
+    """Malformed calls should not enqueue/trigger approval first."""
+    approval_calls = []
+
+    def fake_check(tool_name=None, operation=None, path=None):
+        approval_calls.append((tool_name, operation, path))
+        return {"approved": False, "error": "approval should not run"}
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    from tools import approval as approval_mod
+    monkeypatch.setattr(approval_mod, "check_file_operation_approval", fake_check)
+
+    result = json.loads(file_tools._handle_read_file({"backend": "local"}))
+
+    assert "missing required field 'path'" in result["error"]
+    assert approval_calls == []
+
+
+def test_check_file_operation_approval_pending_returns_metadata(monkeypatch):
+    """Pending approval returns command/pattern metadata, not just status."""
+    from tools import approval as approval_mod
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    session_key = "gw-pending-metadata"
+    token = approval_mod.set_current_session_key(session_key)
+    try:
+        result = approval_mod.check_file_operation_approval(
+            tool_name="read_file", operation="read", path="/etc/passwd",
+        )
+    finally:
+        approval_mod.reset_current_session_key(token)
+
+    assert result["approved"] is False
+    assert result["status"] == "pending_approval"
+    assert result["pattern_key"] == "file:read_file"
+    assert result["pattern_keys"] == ["file:read_file"]
+    assert "read_file" in result["command"]
+    assert result["description"]
+
 def test_check_file_operation_approval_yolo_bypass(monkeypatch):
     """check_file_operation_approval auto-approves when YOLO mode is active."""
     from tools import approval as approval_mod
