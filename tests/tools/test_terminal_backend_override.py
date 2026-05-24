@@ -486,156 +486,346 @@ def test_file_tool_local_docker_caches_coexist_for_same_task(monkeypatch):
 
 # ── Approval gating tests ─────────────────────────────────────────────
 
+# _check_local_file_operation_approval delegates to
+# tools.approval.check_file_operation_approval for the actual gating.
+# The tests below verify handler-level integration and the approval
+# function directly.
 
-def test_local_file_read_triggers_approval_when_default_is_docker(monkeypatch):
-    approval_calls = []
 
-    def fake_approval(**kwargs):
-        approval_calls.append(kwargs)
-        return {"approved": True}
-
+def test_file_approval_backend_validated_early(monkeypatch):
+    """Invalid backend values are rejected before reaching the approval layer."""
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     monkeypatch.setenv("TERMINAL_CWD", "/workspace")
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
 
+    result = json.loads(file_tools._handle_read_file({
+        "path": "/test.txt", "backend": "nonexistent",
+    }))
+
+    assert "error" in result
+    assert "invalid" in str(result["error"]).lower() or "backend" in str(result).lower()
+
+
+def test_file_approval_no_gate_when_configured_local(monkeypatch):
+    """No approval gating when TERMINAL_ENV is local."""
+    approval_calls = []
+
+    def fake_check(tool_name=None, operation=None, path=None):
+        approval_calls.append((tool_name, operation, path))
+        return {"approved": True}
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    from tools import approval as approval_mod
+    monkeypatch.setattr(approval_mod, "check_file_operation_approval", fake_check)
+
     env = FakeEnvironment("local")
     terminal_tool._active_environments[("default", "local")] = env
     terminal_tool._last_activity[("default", "local")] = 1.0
-
-    monkeypatch.setattr(file_tools, "_check_local_file_operation_approval", fake_approval)
 
     file_tools._handle_read_file({"path": "/test.txt", "backend": "local"})
 
-    assert len(approval_calls) >= 1
-    assert approval_calls[0].get("backend") == "local"
+    assert len(approval_calls) == 0
 
 
-def test_local_file_write_triggers_approval_when_default_is_docker(monkeypatch):
+def test_file_approval_no_gate_for_docker_backend_ops(monkeypatch):
+    """No approval gating when backend is docker (not requesting local override)."""
     approval_calls = []
 
-    def fake_approval(**kwargs):
-        approval_calls.append(kwargs)
-        return {"approved": True}
-
-    def fake_get_file_ops(task_id="default", backend=None):
-        ops = MagicMock()
-        result_obj = MagicMock()
-        result_obj.to_dict.return_value = {}
-        ops.write_file.return_value = result_obj
-        return ops
-
-    monkeypatch.setenv("TERMINAL_ENV", "docker")
-    monkeypatch.setenv("TERMINAL_CWD", "/workspace")
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-
-    env = FakeEnvironment("local")
-    terminal_tool._active_environments[("default", "local")] = env
-    terminal_tool._last_activity[("default", "local")] = 1.0
-
-    monkeypatch.setattr(file_tools, "_get_file_ops", fake_get_file_ops)
-    monkeypatch.setattr(file_tools, "_check_local_file_operation_approval", fake_approval)
-
-    file_tools._handle_write_file({"path": "/test.txt", "content": "hello", "backend": "local"})
-
-    assert len(approval_calls) >= 1
-    assert approval_calls[0].get("backend") == "local"
-
-
-def test_local_file_patch_triggers_approval_when_default_is_docker(monkeypatch):
-    approval_calls = []
-
-    def fake_approval(**kwargs):
-        approval_calls.append(kwargs)
-        return {"approved": True}
-
-    def fake_get_file_ops(task_id="default", backend=None):
-        ops = MagicMock()
-        result_obj = MagicMock()
-        result_obj.to_dict.return_value = {}
-        ops.patch_replace.return_value = result_obj
-        return ops
-
-    monkeypatch.setenv("TERMINAL_ENV", "docker")
-    monkeypatch.setenv("TERMINAL_CWD", "/workspace")
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-
-    env = FakeEnvironment("local")
-    terminal_tool._active_environments[("default", "local")] = env
-    terminal_tool._last_activity[("default", "local")] = 1.0
-
-    monkeypatch.setattr(file_tools, "_get_file_ops", fake_get_file_ops)
-    monkeypatch.setattr(file_tools, "_check_local_file_operation_approval", fake_approval)
-
-    file_tools._handle_patch({
-        "mode": "replace", "path": "/test.txt",
-        "old_string": "a", "new_string": "b",
-        "backend": "local",
-    })
-
-    assert len(approval_calls) >= 1
-    assert approval_calls[0].get("backend") == "local"
-
-
-def test_docker_file_ops_do_not_require_local_approval(monkeypatch):
-    approval_calls = []
-
-    def fake_approval(**kwargs):
-        approval_calls.append(kwargs)
+    def fake_check(tool_name=None, operation=None, path=None):
+        approval_calls.append((tool_name, operation, path))
         return {"approved": True}
 
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     monkeypatch.setenv("TERMINAL_CWD", "/workspace")
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    from tools import approval as approval_mod
+    monkeypatch.setattr(approval_mod, "check_file_operation_approval", fake_check)
 
     env = FakeEnvironment("docker")
     terminal_tool._active_environments[("default", "docker")] = env
     terminal_tool._last_activity[("default", "docker")] = 1.0
 
-    monkeypatch.setattr(file_tools, "_check_local_file_operation_approval", fake_approval)
-
     file_tools._handle_read_file({"path": "/test.txt"})
 
     assert len(approval_calls) == 0
 
 
-def test_local_file_approval_denial_returns_error(monkeypatch):
-    def fake_approval(**kwargs):
-        return {"approved": False, "error": "Local file operation denied by approval policy"}
+def test_handler_passes_approved_call_through(monkeypatch):
+    """When check_file_operation_approval returns approved=True, the handler
+    proceeds to execute the file operation."""
+    approval_calls = []
+
+    def fake_check(tool_name=None, operation=None, path=None):
+        approval_calls.append({"tool_name": tool_name, "operation": operation, "path": path})
+        return {"approved": True}
+
+    def fake_get_file_ops(task_id="default", backend=None):
+        ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.content = "approved-read"
+        result_obj.to_dict.return_value = {"content": "approved-read"}
+        ops.read_file.return_value = result_obj
+        return ops
 
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     monkeypatch.setenv("TERMINAL_CWD", "/workspace")
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    from tools import approval as approval_mod
+    monkeypatch.setattr(approval_mod, "check_file_operation_approval", fake_check)
+    monkeypatch.setattr(file_tools, "_get_file_ops", fake_get_file_ops)
 
     env = FakeEnvironment("local")
     terminal_tool._active_environments[("default", "local")] = env
     terminal_tool._last_activity[("default", "local")] = 1.0
 
-    monkeypatch.setattr(file_tools, "_check_local_file_operation_approval", fake_approval)
+    result = json.loads(file_tools._handle_read_file({
+        "path": "/etc/shadow", "backend": "local",
+    }))
+
+    assert len(approval_calls) == 1
+    assert approval_calls[0]["tool_name"] == "read_file"
+    assert approval_calls[0]["operation"] == "read"
+    assert approval_calls[0]["path"] == "/etc/shadow"
+    assert "approved-read" in str(result)
+
+
+def test_handler_blocks_denied_call_without_mutation(monkeypatch):
+    """When check_file_operation_approval returns approved=False, the handler
+    returns an error WITHOUT touching the filesystem."""
+    operation_proceeded = []
+
+    def fake_check(tool_name=None, operation=None, path=None):
+        return {"approved": False, "error": "User denied the operation"}
+
+    def fake_get_file_ops(task_id="default", backend=None):
+        operation_proceeded.append(True)
+        return None
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", "/workspace")
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    from tools import approval as approval_mod
+    monkeypatch.setattr(approval_mod, "check_file_operation_approval", fake_check)
+    monkeypatch.setattr(file_tools, "_get_file_ops", fake_get_file_ops)
+
+    env = FakeEnvironment("local")
+    terminal_tool._active_environments[("default", "local")] = env
+    terminal_tool._last_activity[("default", "local")] = 1.0
 
     result = json.loads(file_tools._handle_read_file({
-        "path": "/test.txt", "backend": "local",
+        "path": "/etc/shadow", "backend": "local",
     }))
 
     assert "error" in result
-    assert "denied" in str(result["error"]).lower() or "denied" in str(result).lower()
+    assert len(operation_proceeded) == 0
 
 
-def test_local_file_read_no_approval_when_default_is_local(monkeypatch):
-    approval_calls = []
+def test_check_file_operation_approval_yolo_bypass(monkeypatch):
+    """check_file_operation_approval auto-approves when YOLO mode is active."""
+    from tools import approval as approval_mod
 
-    def fake_approval(**kwargs):
-        approval_calls.append(kwargs)
-        return {"approved": True}
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
 
-    monkeypatch.setenv("TERMINAL_ENV", "local")
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    result = approval_mod.check_file_operation_approval(
+        tool_name="read_file", operation="read", path="/etc/passwd",
+    )
+    assert result["approved"] is True
 
-    env = FakeEnvironment("local")
-    terminal_tool._active_environments[("default", "local")] = env
-    terminal_tool._last_activity[("default", "local")] = 1.0
 
-    monkeypatch.setattr(file_tools, "_check_local_file_operation_approval", fake_approval)
+def test_check_file_operation_approval_mode_off_bypass(monkeypatch):
+    """check_file_operation_approval auto-approves when approvals.mode=off."""
+    from tools import approval as approval_mod
+    from unittest.mock import patch
 
-    file_tools._handle_read_file({"path": "/test.txt"})
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
 
-    assert len(approval_calls) == 0
+    with patch.object(approval_mod, "_get_approval_mode", return_value="off"):
+        result = approval_mod.check_file_operation_approval(
+            tool_name="write_file", operation="write", path="/etc/hosts",
+        )
+    assert result["approved"] is True
+
+
+def test_check_file_operation_approval_cli_auto_approves(monkeypatch):
+    """check_file_operation_approval auto-approves in CLI interactive mode."""
+    from tools import approval as approval_mod
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+
+    result = approval_mod.check_file_operation_approval(
+        tool_name="patch", operation="patch", path="/opt/app.py",
+    )
+    assert result["approved"] is True
+
+
+def test_check_file_operation_approval_noninteractive_hard_block(monkeypatch):
+    """check_file_operation_approval hard-blocks in non-interactive contexts
+    (no YOLO, no CLI, no gateway)."""
+    from tools import approval as approval_mod
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+
+    result = approval_mod.check_file_operation_approval(
+        tool_name="read_file", operation="read", path="/etc/passwd",
+    )
+    assert result["approved"] is False
+    assert "error" in result
+    assert "non-interactive" in str(result["error"]).lower()
+
+
+def test_check_file_operation_approval_gateway_uses_queue(monkeypatch):
+    """check_file_operation_approval uses the gateway queue when a notify
+    callback is registered."""
+    import contextvars
+    import threading
+    from tools import approval as approval_mod
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    notify_calls = []
+    notify_event = threading.Event()
+
+    def notify_cb(data):
+        notify_calls.append(data)
+        notify_event.set()
+
+    session_key = "gw-test-session"
+    approval_mod.register_gateway_notify(session_key, notify_cb)
+
+    token = approval_mod.set_current_session_key(session_key)
+    ctx = contextvars.copy_context()
+
+    result_holder = {}
+
+    def run_check():
+        result_holder["result"] = approval_mod.check_file_operation_approval(
+            tool_name="search_files", operation="search", path="/var/log",
+        )
+
+    t = threading.Thread(target=ctx.run, args=(run_check,), daemon=True)
+    t.start()
+
+    notified = notify_event.wait(timeout=5)
+    assert notified, "notify callback was never called"
+
+    assert len(notify_calls) == 1
+    assert "search_files" in notify_calls[0].get("command", "")
+
+    approval_mod.resolve_gateway_approval(session_key, "once")
+
+    t.join(timeout=5)
+    assert not t.is_alive(), "approval thread still blocked after resolve"
+
+    result = result_holder.get("result", {})
+    assert result.get("approved") is True
+    assert result.get("user_approved") is True
+
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(token)
+
+
+def test_check_file_operation_approval_gateway_deny(monkeypatch):
+    """check_file_operation_approval returns denied when user sends /deny."""
+    import contextvars
+    import threading
+    from tools import approval as approval_mod
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    notify_event = threading.Event()
+
+    def notify_cb(data):
+        notify_event.set()
+
+    session_key = "gw-test-deny"
+    approval_mod.register_gateway_notify(session_key, notify_cb)
+
+    token = approval_mod.set_current_session_key(session_key)
+    ctx = contextvars.copy_context()
+
+    result_holder = {}
+
+    def run_check():
+        result_holder["result"] = approval_mod.check_file_operation_approval(
+            tool_name="write_file", operation="write", path="/etc/crontab",
+        )
+
+    t = threading.Thread(target=ctx.run, args=(run_check,), daemon=True)
+    t.start()
+
+    notified = notify_event.wait(timeout=5)
+    assert notified
+
+    approval_mod.resolve_gateway_approval(session_key, "deny")
+
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+    result = result_holder.get("result", {})
+    assert result.get("approved") is False
+    assert "error" in result
+    assert "denied" in str(result["error"]).lower()
+
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(token)
+
+
+def test_check_file_operation_approval_gateway_timeout(monkeypatch):
+    """check_file_operation_approval returns denied on timeout."""
+    import contextvars
+    import threading
+    from tools import approval as approval_mod
+    from unittest.mock import patch
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    notify_event = threading.Event()
+
+    def notify_cb(data):
+        notify_event.set()
+
+    session_key = "gw-test-timeout"
+    approval_mod.register_gateway_notify(session_key, notify_cb)
+
+    token = approval_mod.set_current_session_key(session_key)
+    ctx = contextvars.copy_context()
+
+    result_holder = {}
+
+    with patch.object(approval_mod, "_get_approval_config", return_value={"gateway_timeout": 1}):
+        def run_check():
+            result_holder["result"] = approval_mod.check_file_operation_approval(
+                tool_name="patch", operation="patch", path="/opt/app.py",
+            )
+
+        t = threading.Thread(target=ctx.run, args=(run_check,), daemon=True)
+        t.start()
+
+        notified = notify_event.wait(timeout=5)
+        assert notified
+
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+    result = result_holder.get("result", {})
+    assert result.get("approved") is False
+    assert "error" in result
+    assert "timed out" in str(result["error"]).lower()
+
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(token)

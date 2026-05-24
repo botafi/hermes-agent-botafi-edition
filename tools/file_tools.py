@@ -379,17 +379,8 @@ def _check_local_file_operation_approval(
     if backend != "local":
         return {"approved": True}
 
-    return {
-        "approved": False,
-        "error": (
-            f"Local file {operation} blocked: the configured terminal backend is "
-            f"docker, but {tool_name} requested backend='local'. This is a sandbox "
-            f"escape attempt. To allow local file operations while using Docker as "
-            f"the default terminal backend, set approvals.file_local_override to "
-            f"'allow' in config.yaml or use terminal(backend='local') to interact "
-            f"with the local filesystem directly."
-        ),
-    }
+    from tools.approval import check_file_operation_approval
+    return check_file_operation_approval(tool_name=tool_name, operation=operation, path=path)
 
 
 def _get_file_ops(task_id: str = "default", backend: Optional[str] = None) -> ShellFileOperations:
