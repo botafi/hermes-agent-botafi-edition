@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { approvalAction } from '../components/prompts.js'
+import { approvalAction, approvalOptions } from '../components/prompts.js'
 
 describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
   it('maps Esc to deny — parity with global Ctrl+C cancellation', () => {
@@ -46,5 +46,20 @@ describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
   it('returns noop for unrelated keystrokes (printable letters etc.)', () => {
     expect(approvalAction('a', {}, 0)).toEqual({ kind: 'noop' })
     expect(approvalAction(' ', {}, 0)).toEqual({ kind: 'noop' })
+  })
+
+  it('omits always for file local-backend approval options', () => {
+    const opts = approvalOptions({ approval_kind: 'file_backend_local' })
+
+    expect(opts).toEqual(['once', 'session', 'session_all', 'deny'])
+    expect(approvalAction('1', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'once' })
+    expect(approvalAction('2', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'session' })
+    expect(approvalAction('3', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'session_all' })
+    expect(approvalAction('4', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'deny' })
+    expect(approvalAction('5', {}, 0, opts)).toEqual({ kind: 'noop' })
+  })
+
+  it('omits always for legacy file pattern-key approval payloads', () => {
+    expect(approvalOptions({ pattern_key: 'file:read_file' })).toEqual(['once', 'session', 'session_all', 'deny'])
   })
 })
