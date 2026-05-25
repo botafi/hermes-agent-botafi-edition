@@ -5112,7 +5112,18 @@ def _define_discord_view_classes() -> None:
             # Unblock the waiting agent thread via the gateway approval queue
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                resolve_all = (
+                    self.approval_kind == "file_backend_local"
+                    and choice == "session_all"
+                )
+                count = resolve_gateway_approval(
+                    self.session_key,
+                    choice,
+                    resolve_all=resolve_all,
+                    approval_kind=(
+                        "file_backend_local" if resolve_all else None
+                    ),
+                )
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,
