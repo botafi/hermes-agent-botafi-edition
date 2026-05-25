@@ -7442,6 +7442,8 @@ class GatewayRunner:
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "context-dump":
+                    return await self._handle_context_dump_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -7790,6 +7792,9 @@ class GatewayRunner:
 
         if canonical == "debug":
             return await self._handle_debug_command(event)
+
+        if canonical == "context-dump":
+            return await self._handle_context_dump_command(event)
 
         if canonical == "title":
             return await self._handle_title_command(event)
@@ -14212,6 +14217,78 @@ class GatewayRunner:
 
         return await loop.run_in_executor(None, _collect_and_upload)
 
+    def _context_dump_agent_for_session(self, session_key: str) -> Any:
+        """Return the running or cached agent for a session, if resident."""
+        agent = self._running_agents.get(session_key)
+        if agent and agent is not _AGENT_PENDING_SENTINEL:
+            return agent
+
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached = _cache.get(session_key)
+                if cached:
+                    return cached[0]
+        return None
+
+    async def _handle_context_dump_command(self, event: MessageEvent) -> str:
+        """Handle /context-dump — upload the last provider request payload."""
+        user_config = self._read_user_config()
+        enabled = bool(
+            cfg_get(user_config, "gateway", "context_dump", "enabled", default=False)
+        )
+        if not enabled:
+            return "/context-dump is disabled. Set gateway.context_dump.enabled: true in config.yaml."
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        agent = self._context_dump_agent_for_session(session_key)
+        snapshot = (
+            getattr(agent, "_last_context_dump_snapshot", None)
+            if agent is not None else None
+        )
+        if not isinstance(snapshot, dict):
+            return (
+                "No LLM request context has been captured for this thread yet. "
+                "Send a normal message first, then run /context-dump."
+            )
+
+        dump_dir = _hermes_home / "debug" / "context_dumps"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        session_id = str(snapshot.get("session_id") or "session")
+        safe_session_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", session_id)[:80] or "session"
+        dump_path = dump_dir / f"context-dump-{safe_session_id}-{timestamp}.json"
+
+        def _write_dump() -> None:
+            atomic_json_write(dump_path, snapshot, indent=2, sort_keys=True)
+
+        await asyncio.to_thread(_write_dump)
+
+        adapter = self.adapters.get(source.platform) if source else None
+        if adapter is None:
+            return f"Context dump saved locally: {dump_path}"
+
+        metadata = self._thread_metadata_for_source(
+            source,
+            self._reply_anchor_for_event(event),
+        )
+        result = await adapter.send_document(
+            chat_id=source.chat_id,
+            file_path=str(dump_path),
+            caption="LLM request context dump",
+            file_name=dump_path.name,
+            metadata=metadata,
+        )
+        if result is not None and getattr(result, "success", True) is False:
+            return (
+                f"Context dump saved locally, but upload failed: "
+                f"{getattr(result, 'error', 'send_document returned success=False')}\n"
+                f"{dump_path}"
+            )
+        return f"Context dump uploaded: `{dump_path.name}`"
+
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update command — update Hermes Agent to the latest version.
 
@@ -16152,6 +16229,9 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        context_dump_enabled = bool(
+            cfg_get(user_config, "gateway", "context_dump", "enabled", default=False)
+        )
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -17040,6 +17120,12 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent._context_dump_enabled = context_dump_enabled
+            if not context_dump_enabled and hasattr(agent, "_last_context_dump_snapshot"):
+                try:
+                    delattr(agent, "_last_context_dump_snapshot")
+                except Exception:
+                    pass
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
