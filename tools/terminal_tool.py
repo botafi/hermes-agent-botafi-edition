@@ -1067,6 +1067,35 @@ def _get_env_config() -> Dict[str, Any]:
                         cwd, env_type, default_cwd)
             cwd = default_cwd
 
+    docker_cwd = os.getenv("TERMINAL_DOCKER_CWD", "")
+    if docker_cwd:
+        docker_cwd = docker_cwd.strip()
+        # Map ~ to /root — the Docker container home.  Do NOT expanduser()
+        # with the host's home directory; that leaks a host-shaped path
+        # into a container CWD.
+        if docker_cwd == "~":
+            docker_cwd = "/root"
+        elif docker_cwd.startswith("~/"):
+            docker_cwd = "/root/" + docker_cwd[2:]
+        # Sanity checks: docker_cwd is a container path.  Host-looking
+        # paths and relative paths are ignored, mirroring TERMINAL_CWD
+        # handling for container backends.  docker_cwd is optional, so
+        # clearing it falls back to the already-sanitized cwd/default_cwd.
+        if any(docker_cwd.startswith(p) for p in ("/Users/", "/home/", "C:\\", "C:/")):
+            logger.info(
+                "Ignoring TERMINAL_DOCKER_CWD=%r for docker backend "
+                "(host-shaped path will not work in sandbox).",
+                docker_cwd,
+            )
+            docker_cwd = ""
+        elif not os.path.isabs(docker_cwd):
+            logger.warning(
+                "Ignoring TERMINAL_DOCKER_CWD=%r for docker backend "
+                "(relative path will not work in sandbox).",
+                docker_cwd,
+            )
+            docker_cwd = ""
+
     return {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
@@ -1077,6 +1106,7 @@ def _get_env_config() -> Dict[str, Any]:
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
         "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
+        "docker_cwd": docker_cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
@@ -1819,6 +1849,8 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
+        if effective_env_type == "docker" and config.get("docker_cwd") and not overrides.get("cwd"):
+            cwd = config["docker_cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
