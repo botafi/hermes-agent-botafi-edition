@@ -564,6 +564,7 @@ def load_cli_config() -> Dict[str, Any]:
     env_mappings = {
         "env_type": "TERMINAL_ENV",
         "cwd": "TERMINAL_CWD",
+        "docker_cwd": "TERMINAL_DOCKER_CWD",
         "timeout": "TERMINAL_TIMEOUT",
         "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
         "docker_image": "TERMINAL_DOCKER_IMAGE",
