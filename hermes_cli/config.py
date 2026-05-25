@@ -1661,6 +1661,12 @@ DEFAULT_CONFIG = {
         # Recency window in seconds. 600 (10 min) comfortably covers a
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         "trust_recent_files_seconds": 600,
+        # Upload the full last-provider-request payload with /context-dump.
+        # Disabled by default because dumps include private conversation and
+        # tool context. Auth material is still stripped before writing.
+        "context_dump": {
+            "enabled": False,
+        },
     },
 
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
