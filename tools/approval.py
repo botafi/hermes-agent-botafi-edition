@@ -546,10 +546,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
     waiting agent thread(s).
 
     When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).  When *approval_kind* is provided, only pending
-    entries with matching ``data["approval_kind"]`` are eligible; this keeps
-    special approval choices such as file-tool ``session_all`` from resolving
+    resolved at once (``/approve all``).  Otherwise the oldest eligible entry
+    is resolved (FIFO).  Session-scoped choices (``session`` and
+    ``session_all``) may additionally resolve queued siblings with matching
+    ``pattern_keys`` so concurrent same-type prompts do not require duplicate
+    clicks.  When *approval_kind* is provided, only pending entries with
+    matching ``data["approval_kind"]`` are eligible; this keeps special
+    approval choices such as file-tool ``session_all`` from resolving
     unrelated dangerous-command prompts.
 
     Returns the number of approvals resolved (0 means nothing was pending).
