@@ -456,7 +456,8 @@ class TestStubSchemaDrift(unittest.TestCase):
     """
 
     # Parameters that are internal (injected by the handler, not user-facing)
-    _INTERNAL_PARAMS = {"task_id", "user_task"}
+    # "backend" is excluded from execute_code sandbox stubs to prevent sandbox escape.
+    _INTERNAL_PARAMS = {"task_id", "user_task", "backend"}
     # Parameters intentionally blocked in the sandbox
     _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns", "backend"}
 
