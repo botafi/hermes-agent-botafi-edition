@@ -73,6 +73,82 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+_CONTEXT_DUMP_AUTH_KEYS = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "api-key",
+    "x-api-key",
+    "api_key",
+    "apikey",
+    "access-token",
+    "access_token",
+    "refresh-token",
+    "refresh_token",
+    "id-token",
+    "id_token",
+    "auth-token",
+    "auth_token",
+    "bearer-token",
+    "bearer_token",
+    "cookie",
+    "set-cookie",
+})
+
+
+def _context_dump_key_is_auth(key: Any) -> bool:
+    normalized = str(key or "").strip().lower().replace("_", "-")
+    if normalized in _CONTEXT_DUMP_AUTH_KEYS:
+        return True
+    return normalized.endswith("-api-key") or normalized.endswith("-auth-token")
+
+
+def _context_dump_json_safe(value: Any) -> Any:
+    """Return a JSON-safe copy of a provider request without auth fields."""
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if _context_dump_key_is_auth(key):
+                continue
+            out[str(key)] = _context_dump_json_safe(item)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_context_dump_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _record_context_dump_snapshot(
+    agent: Any,
+    *,
+    api_kwargs: Dict[str, Any],
+    api_call_count: int,
+    approx_tokens: int,
+    total_chars: int,
+) -> None:
+    """Store the last exact provider request for gateway /context-dump."""
+    if not getattr(agent, "_context_dump_enabled", False):
+        return
+    try:
+        snapshot = {
+            "schema_version": 1,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "session_id": getattr(agent, "session_id", "") or "",
+            "platform": getattr(agent, "platform", "") or "",
+            "provider": getattr(agent, "provider", "") or "",
+            "model": getattr(agent, "model", "") or "",
+            "api_mode": getattr(agent, "api_mode", "") or "",
+            "base_url": getattr(agent, "base_url", "") or "",
+            "api_call_count": api_call_count,
+            "approx_input_tokens": approx_tokens,
+            "request_char_count": total_chars,
+            "payload": _context_dump_json_safe(api_kwargs),
+        }
+        agent._last_context_dump_snapshot = snapshot
+    except Exception:
+        logger.debug("Failed to record context dump snapshot", exc_info=True)
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -1196,6 +1272,14 @@ def run_conversation(
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                if getattr(agent, "_context_dump_enabled", False):
+                    _record_context_dump_snapshot(
+                        agent,
+                        api_kwargs=api_kwargs,
+                        api_call_count=api_call_count,
+                        approx_tokens=approx_tokens,
+                        total_chars=total_chars,
+                    )
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
