@@ -988,3 +988,575 @@ def test_check_file_operation_approval_gateway_timeout(monkeypatch):
 
     approval_mod.unregister_gateway_notify(session_key)
     approval_mod.reset_current_session_key(token)
+
+
+# ── Stage 1: Session persistence for file local-backend approvals ────────
+
+
+def _run_file_approval_in_thread(approval_mod, session_key, tool_name,
+                                  operation, path, monkeypatch):
+    """Helper: run check_file_operation_approval in a thread via the
+    blocking gateway queue.  Returns (thread, result_holder, token).
+
+    The caller MUST call:
+        approval_mod.unregister_gateway_notify(session_key)
+        approval_mod.reset_current_session_key(token)
+    after resolving and joining the thread.
+    """
+    import contextvars
+    import threading
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    notify_event = threading.Event()
+
+    def notify_cb(data):
+        notify_event.set()
+
+    approval_mod.register_gateway_notify(session_key, notify_cb)
+
+    token = approval_mod.set_current_session_key(session_key)
+    ctx = contextvars.copy_context()
+
+    result_holder = {}
+
+    def run_check():
+        result_holder["result"] = approval_mod.check_file_operation_approval(
+            tool_name=tool_name, operation=operation, path=path,
+        )
+
+    t = threading.Thread(target=ctx.run, args=(run_check,), daemon=True)
+    t.start()
+
+    notified = notify_event.wait(timeout=5)
+    assert notified, "notify callback was never called"
+
+    t.join(timeout=1)
+    assert t.is_alive(), "thread should still be blocked on approval"
+
+    return t, result_holder, token
+
+
+def test_file_approval_once_does_not_persist(monkeypatch):
+    """choice='once' approves current operation but does NOT persist
+    so the next call to the same file tool re-prompts."""
+    import threading
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-once"
+
+    # --- First call: approve once ---
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/passwd", monkeypatch,
+    )
+
+    approval_mod.resolve_gateway_approval(session_key, "once")
+    t1.join(timeout=5)
+    assert not t1.is_alive()
+
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    result1 = holder1.get("result", {})
+    assert result1.get("approved") is True
+    assert result1.get("user_approved") is True
+
+    # --- Second call to same tool: must re-prompt since not persisted ---
+    t2, holder2, tok2 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/hosts", monkeypatch,
+    )
+
+    approval_mod.resolve_gateway_approval(session_key, "once")
+    t2.join(timeout=5)
+    assert not t2.is_alive()
+
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok2)
+
+    result2 = holder2.get("result", {})
+    assert result2.get("approved") is True
+    assert result2.get("user_approved") is True
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_persists_for_same_tool(monkeypatch):
+    """choice='session' persists approval so the next call to the
+    SAME file tool skips the prompt."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-session"
+
+    # --- First call: approve for session ---
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "write_file", "write", "/tmp/test.py", monkeypatch,
+    )
+
+    approval_mod.resolve_gateway_approval(session_key, "session")
+    t1.join(timeout=5)
+    assert not t1.is_alive()
+
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    result1 = holder1.get("result", {})
+    assert result1.get("approved") is True
+    assert result1.get("user_approved") is True
+
+    # --- Second call to same tool: must skip approval ---
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    token2 = approval_mod.set_current_session_key(session_key)
+    result2 = approval_mod.check_file_operation_approval(
+        tool_name="write_file", operation="write", path="/tmp/other.py",
+    )
+    approval_mod.reset_current_session_key(token2)
+
+    assert result2.get("approved") is True
+    # Should NOT have user_approved (auto-approved from session cache)
+    assert not result2.get("user_approved")
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_different_tool_re_prompts(monkeypatch):
+    """A session approval for read_file does NOT auto-approve write_file."""
+    import threading
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-different-tool"
+
+    # --- Approve read_file for session ---
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+
+    approval_mod.resolve_gateway_approval(session_key, "session")
+    t1.join(timeout=5)
+    assert not t1.is_alive()
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    # --- Call write_file: must re-prompt ---
+    t2, holder2, tok2 = _run_file_approval_in_thread(
+        approval_mod, session_key, "write_file", "write", "/etc/hostname", monkeypatch,
+    )
+
+    approval_mod.resolve_gateway_approval(session_key, "once")
+    t2.join(timeout=5)
+    assert not t2.is_alive()
+    assert holder2["result"]["approved"] is True
+    assert holder2["result"]["user_approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok2)
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_different_session_re_prompts(monkeypatch):
+    """A session approval in session A does NOT auto-approve session B."""
+    from tools import approval as approval_mod
+
+    session_a = "gw-test-session-a"
+
+    # --- Approve read_file in session A ---
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_a, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_a, "session")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_a)
+    approval_mod.reset_current_session_key(tok1)
+
+    # --- Session B: same tool, must re-prompt ---
+    session_b = "gw-test-session-b"
+    t2, holder2, tok2 = _run_file_approval_in_thread(
+        approval_mod, session_b, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_b, "once")
+    t2.join(timeout=5)
+    assert holder2["result"]["approved"] is True
+    assert holder2["result"]["user_approved"] is True
+    approval_mod.unregister_gateway_notify(session_b)
+    approval_mod.reset_current_session_key(tok2)
+
+    approval_mod.clear_session(session_a)
+    approval_mod.clear_session(session_b)
+
+
+def test_file_approval_always_treated_as_session_only(monkeypatch):
+    """choice='always' is treated as session-only for file approvals:
+    it persists per-tool for the session but does NOT write a
+    permanent allowlist entry."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-always-as-session"
+
+    # --- First call: approve 'always' ---
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "patch", "patch", "/opt/app.py", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "always")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    assert holder1["result"]["user_approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    # --- Second call same session, same tool: skip approval ---
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    token2 = approval_mod.set_current_session_key(session_key)
+    result2 = approval_mod.check_file_operation_approval(
+        tool_name="patch", operation="patch", path="/opt/other.py",
+    )
+    approval_mod.reset_current_session_key(token2)
+
+    assert result2.get("approved") is True
+    assert not result2.get("user_approved")
+
+    # --- The permanent allowlist must NOT contain the file pattern ---
+    with approval_mod._lock:
+        perms = set(approval_mod._permanent_approved)
+    file_keys = {k for k in perms if k.startswith("file:")}
+    assert len(file_keys) == 0, (
+        f"permanent allowlist must not contain file keys, got {file_keys}"
+    )
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_respected_in_retry(monkeypatch):
+    """After session approval, a new call (different thread, same session)
+    returns approved=True immediately without blocking."""
+    import threading
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-retry"
+
+    # --- Approve search_files for session ---
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "search_files", "search", "/var/log", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session")
+    t1.join(timeout=5)
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    # --- Second call: should return immediately, no thread needed ---
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    token = approval_mod.set_current_session_key(session_key)
+    result = approval_mod.check_file_operation_approval(
+        tool_name="search_files", operation="search", path="/var/log/syslog",
+    )
+    approval_mod.reset_current_session_key(token)
+
+    assert result.get("approved") is True
+    assert "error" not in result
+    assert not result.get("user_approved")  # cached, not freshly user-approved
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_full_session_lifecycle(monkeypatch):
+    """End-to-end: approve once, approve session, verify persistence across
+    all four file tools."""
+    import threading
+    from tools import approval as approval_mod
+
+    session_key = "gw-lifecycle"
+
+    # --- read_file: approve once ---
+    t1, h1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/issue", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "once")
+    t1.join(timeout=5)
+    assert h1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    # --- read_file again: must re-prompt (once doesn't persist) ---
+    t2, h2, tok2 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/issue", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session")
+    t2.join(timeout=5)
+    assert h2["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok2)
+
+    # --- read_file again: now it should skip (session persisted) ---
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    token = approval_mod.set_current_session_key(session_key)
+    r3 = approval_mod.check_file_operation_approval(
+        tool_name="read_file", operation="read", path="/etc/issue",
+    )
+    approval_mod.reset_current_session_key(token)
+    assert r3["approved"] is True
+    assert not r3.get("user_approved")
+
+    # --- write_file: must re-prompt (different tool) ---
+    t4, h4, tok4 = _run_file_approval_in_thread(
+        approval_mod, session_key, "write_file", "write", "/tmp/x", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session")
+    t4.join(timeout=5)
+    assert h4["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok4)
+
+    # --- patch: must re-prompt (different tool) ---
+    t5, h5, tok5 = _run_file_approval_in_thread(
+        approval_mod, session_key, "patch", "patch", "/opt/x.py", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session")
+    t5.join(timeout=5)
+    assert h5["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok5)
+
+    # --- search_files: must re-prompt (different tool) ---
+    t6, h6, tok6 = _run_file_approval_in_thread(
+        approval_mod, session_key, "search_files", "search", "/var/log", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session")
+    t6.join(timeout=5)
+    assert h6["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok6)
+
+    # --- Now all four tools are session-approved; verify each ---
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    for tool_name in ("read_file", "write_file", "patch", "search_files"):
+        token_x = approval_mod.set_current_session_key(session_key)
+        r = approval_mod.check_file_operation_approval(
+            tool_name=tool_name, operation="read", path="/any/path",
+        )
+        approval_mod.reset_current_session_key(token_x)
+        assert r["approved"] is True, f"{tool_name} should be session-approved"
+        assert not r.get("user_approved"), f"{tool_name} should be cached"
+
+    approval_mod.clear_session(session_key)
+
+
+# ── Stage 2: session_all file backend approvals ────────────────────────
+
+
+def test_file_approval_session_all_covers_all_file_tools(monkeypatch):
+    """choice='session_all' persists under 'file:backend:local:any' and
+    auto-approves any subsequent file tool in the same session."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-session-all"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session_all")
+    t1.join(timeout=5)
+    assert not t1.is_alive()
+    assert holder1["result"]["approved"] is True
+    assert holder1["result"]["user_approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    for tool_name in ("read_file", "write_file", "patch", "search_files"):
+        token_x = approval_mod.set_current_session_key(session_key)
+        r = approval_mod.check_file_operation_approval(
+            tool_name=tool_name, operation="read", path="/any/path",
+        )
+        approval_mod.reset_current_session_key(token_x)
+        assert r["approved"] is True, f"{tool_name} should be covered by session_all"
+        assert not r.get("user_approved"), f"{tool_name} should be cached"
+
+    with approval_mod._lock:
+        perms = set(approval_mod._permanent_approved)
+    assert "file:backend:local:any" not in perms, (
+        "permanent allowlist must not contain file:backend:local:any"
+    )
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_all_does_not_leak_across_sessions(monkeypatch):
+    """session_all in session A does NOT auto-approve session B."""
+    from tools import approval as approval_mod
+
+    session_a = "gw-test-sa-sessions-a"
+    session_b = "gw-test-sa-sessions-b"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_a, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_a, "session_all")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_a)
+    approval_mod.reset_current_session_key(tok1)
+
+    t2, holder2, tok2 = _run_file_approval_in_thread(
+        approval_mod, session_b, "search_files", "search", "/var/log", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_b, "once")
+    t2.join(timeout=5)
+    assert holder2["result"]["approved"] is True
+    assert holder2["result"]["user_approved"] is True
+    approval_mod.unregister_gateway_notify(session_b)
+    approval_mod.reset_current_session_key(tok2)
+
+    approval_mod.clear_session(session_a)
+    approval_mod.clear_session(session_b)
+
+
+def test_file_approval_permanent_file_allowlist_entries_are_ignored(monkeypatch):
+    """Stale command_allowlist file:* entries must not bypass local file approval."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-stale-file-perm"
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    with approval_mod._lock:
+        approval_mod._permanent_approved.add("file:backend:local:any")
+        approval_mod._permanent_approved.add("file:read_file")
+
+    token = approval_mod.set_current_session_key(session_key)
+    try:
+        result = approval_mod.check_file_operation_approval(
+            tool_name="read_file", operation="read", path="/etc/hostname",
+        )
+    finally:
+        approval_mod.reset_current_session_key(token)
+        with approval_mod._lock:
+            approval_mod._permanent_approved.discard("file:backend:local:any")
+            approval_mod._permanent_approved.discard("file:read_file")
+        approval_mod.clear_session(session_key)
+
+    assert result.get("approved") is False
+    assert result.get("status") == "pending_approval"
+    assert result.get("approval_kind") == "file_backend_local"
+
+
+def test_resolve_gateway_approval_filters_file_session_all_by_kind():
+    """A file-only approval choice must not resolve queued dangerous commands."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-kind-filter"
+    dangerous = approval_mod._ApprovalEntry({
+        "command": "rm -rf /tmp/example",
+        "description": "dangerous command",
+        "pattern_key": "dangerous:rm-rf",
+    })
+    file_entry = approval_mod._ApprovalEntry({
+        "command": "read_file(path='/etc/hostname', backend='local')",
+        "description": "local file read",
+        "pattern_key": "file:read_file",
+        "approval_kind": "file_backend_local",
+    })
+
+    with approval_mod._lock:
+        approval_mod._gateway_queues[session_key] = [dangerous, file_entry]
+
+    count = approval_mod.resolve_gateway_approval(
+        session_key,
+        "session_all",
+        resolve_all=True,
+        approval_kind="file_backend_local",
+    )
+
+    assert count == 1
+    assert dangerous.result is None
+    assert not dangerous.event.is_set()
+    assert file_entry.result == "session_all"
+    assert file_entry.event.is_set()
+    with approval_mod._lock:
+        assert approval_mod._gateway_queues[session_key] == [dangerous]
+        approval_mod._gateway_queues.pop(session_key, None)
+
+
+def test_file_approval_session_all_does_not_affect_dangerous_commands(monkeypatch):
+    """session_all must NOT auto-approve dangerous command patterns."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-sa-no-dc"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "write_file", "write", "/tmp/test.py", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session_all")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    with approval_mod._lock:
+        perms = set(approval_mod._permanent_approved)
+    assert len(perms) == 0, "session_all must not write to permanent allowlist"
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    token = approval_mod.set_current_session_key(session_key)
+    result = approval_mod.check_dangerous_command(
+        "rm -rf /tmp/some-test-dir", "local",
+    )
+    approval_mod.reset_current_session_key(token)
+
+    if not result.get("approved"):
+        assert "pattern_key" in result
+
+    approval_mod.clear_session(session_key)
+
+
+def test_file_approval_session_all_key_is_umbrella_not_per_tool(monkeypatch):
+    """session_all persists 'file:backend:local:any', not per-tool keys."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-sa-umbrella"
+
+    t1, holder1, tok1 = _run_file_approval_in_thread(
+        approval_mod, session_key, "read_file", "read", "/etc/hostname", monkeypatch,
+    )
+    approval_mod.resolve_gateway_approval(session_key, "session_all")
+    t1.join(timeout=5)
+    assert holder1["result"]["approved"] is True
+    approval_mod.unregister_gateway_notify(session_key)
+    approval_mod.reset_current_session_key(tok1)
+
+    with approval_mod._lock:
+        session_apps = approval_mod._session_approved.get(session_key, set())
+    assert "file:backend:local:any" in session_apps, (
+        "file:backend:local:any must be in session approvals"
+    )
+    assert "file:read_file" not in session_apps, (
+        "per-tool file:read_file must NOT be in session approvals"
+    )
+    assert "file:write_file" not in session_apps, (
+        "per-tool file:write_file must NOT be in session approvals"
+    )
+
+    approval_mod.clear_session(session_key)
