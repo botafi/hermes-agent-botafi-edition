@@ -90,8 +90,12 @@ export interface DelegationStatus {
 }
 
 export interface ApprovalReq {
+  approval_kind?: string
   command: string
   description: string
+  pattern_key?: string
+  pattern_keys?: string[]
+  tool_name?: string
 }
 
 export interface ConfirmReq {

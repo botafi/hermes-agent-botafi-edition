@@ -13874,19 +13874,34 @@ class GatewayRunner:
                 return t("gateway.approval_expired")
             return t("gateway.approve.no_pending")
 
-        # Parse args: support "all", "all session", "all always", "session", "always"
+        # Parse args: support "all", "all session", "all always", "session", "always".
+        # For file-tool backend override approvals, "files" / "file-tools" maps to
+        # session_all (allow all file tools for this session) without touching
+        # dangerous-command permanent/session approval semantics.
         args = event.get_command_args().strip().lower().split()
         resolve_all = "all" in args
         remaining = [a for a in args if a != "all"]
 
-        if any(a in {"always", "permanent", "permanently"} for a in remaining):
+        files_scope = any(a in {"files", "file", "file-tools", "filetools"} for a in remaining)
+        if files_scope:
+            choice = "session_all"
+            # `/approve files` is a file-backend approval action, not a dangerous-command
+            # approval. Resolve only file approval entries so it cannot accidentally
+            # approve an unrelated shell command waiting in the same session.
+            resolve_all = True
+        elif any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
         elif any(a in {"session", "ses"} for a in remaining):
             choice = "session"
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=resolve_all,
+            approval_kind="file_backend_local" if files_scope else None,
+        )
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -13895,7 +13910,9 @@ class GatewayRunner:
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
+        logger.info("User approved %d approval request(s) via /approve (%s)", count, choice)
+        if choice == "session_all":
+            return f"✅ Approved all file tools for this session ({count} approval{'s' if count != 1 else ''})."
         plural = "plural" if count > 1 else "singular"
         return t(f"gateway.approve.{choice}_{plural}", count=count)
 
@@ -17032,7 +17049,7 @@ class GatewayRunner:
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata={**(_status_thread_metadata or {}), **approval_data},
                             ),
                             _loop_for_step,
                             logger=logger,
@@ -17054,12 +17071,23 @@ class GatewayRunner:
 
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                is_file_backend_approval = approval_data.get("approval_kind") == "file_backend_local"
+                if is_file_backend_approval:
+                    approval_help = (
+                        "Reply `/approve` to allow once, `/approve session` to allow this file tool "
+                        "for the session, `/approve files` to allow all file tools for the session, "
+                        "or `/deny` to cancel."
+                    )
+                else:
+                    approval_help = (
+                        "Reply `/approve` to execute, `/approve session` to approve this pattern "
+                        "for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+                    )
                 msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
+                    f"⚠️ **Approval required:**\n"
                     f"```\n{cmd_preview}\n```\n"
                     f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+                    f"{approval_help}"
                 )
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
