@@ -41,8 +41,9 @@ export function approvalOptions(req?: Pick<ApprovalReq, 'approval_kind' | 'patte
  *
  * Esc and number keys both terminate the prompt; Esc maps to deny (parity
  * with the global Ctrl+C handler that already calls cancelOverlayFromCtrlC
- * for approvals).  Numbers 1..OPTS.length pick the labelled choice.  Enter
- * confirms the current selection.  ↑/↓ moves the selection within bounds.
+ * for approvals).  Numbers 1..opts.length pick from the active option list.
+ * Enter confirms the current selection.  ↑/↓ moves the selection within the
+ * active option list bounds.
  */
 export function approvalAction(ch: string, key: ApprovalKey, sel: number,
                                opts: readonly ApprovalOption[] = COMMAND_APPROVAL_OPTS): ApprovalAction {

@@ -540,13 +540,17 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
+                             resolve_all: bool = False,
+                             approval_kind: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
     When *resolve_all* is True every pending approval in the session is
     resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    is resolved (FIFO).  When *approval_kind* is provided, only pending
+    entries with matching ``data["approval_kind"]`` are eligible; this keeps
+    special approval choices such as file-tool ``session_all`` from resolving
+    unrelated dangerous-command prompts.
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
@@ -554,7 +558,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if approval_kind is not None:
+            matching = [entry for entry in queue if entry.data.get("approval_kind") == approval_kind]
+            if not matching:
+                return 0
+            targets = matching if resolve_all else [matching[0]]
+            for entry in targets:
+                queue.remove(entry)
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -641,6 +652,19 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
             return True
+        session_approvals = _session_approved.get(session_key, set())
+        return any(alias in session_approvals for alias in aliases)
+
+
+def is_session_approved(session_key: str, pattern_key: str) -> bool:
+    """Check if a pattern is approved for this session only.
+
+    File local-backend approvals must never be satisfied by the permanent
+    command allowlist: old/stale ``command_allowlist`` entries that start with
+    ``file:`` should not silently bypass the local filesystem escape hatch.
+    """
+    aliases = _approval_key_aliases(pattern_key)
+    with _lock:
         session_approvals = _session_approved.get(session_key, set())
         return any(alias in session_approvals for alias in aliases)
 
@@ -1451,12 +1475,12 @@ def check_file_operation_approval(
     session_key = get_current_session_key()
 
     # Check if the session_all umbrella approval is active (Stage 2).
-    if is_approved(session_key, "file:backend:local:any"):
+    if is_session_approved(session_key, "file:backend:local:any"):
         return {"approved": True}
 
     # Check if this file tool is already session-approved.
     file_pattern_key = f"file:{tool_name}"
-    if is_approved(session_key, file_pattern_key):
+    if is_session_approved(session_key, file_pattern_key):
         return {"approved": True}
 
     if is_gateway or is_ask:

@@ -3042,7 +3042,7 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_restart(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/restart", "Restart requested~")
 
-        @tree.command(name="approve", description="Approve a pending dangerous command")
+        @tree.command(name="approve", description="Approve a pending command or file access request")
         @discord.app_commands.describe(scope="Optional: 'session', 'files', 'always', 'all', 'all session', 'all always'")
         async def slash_approve(interaction: discord.Interaction, scope: str = ""):
             await self._run_simple_slash(interaction, f"/approve {scope}".strip())

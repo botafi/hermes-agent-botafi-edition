@@ -13545,8 +13545,13 @@ class GatewayRunner:
         resolve_all = "all" in args
         remaining = [a for a in args if a != "all"]
 
-        if any(a in {"files", "file", "file-tools", "filetools"} for a in remaining):
+        files_scope = any(a in {"files", "file", "file-tools", "filetools"} for a in remaining)
+        if files_scope:
             choice = "session_all"
+            # `/approve files` is a file-backend approval action, not a dangerous-command
+            # approval. Resolve only file approval entries so it cannot accidentally
+            # approve an unrelated shell command waiting in the same session.
+            resolve_all = True
         elif any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
         elif any(a in {"session", "ses"} for a in remaining):
@@ -13554,7 +13559,12 @@ class GatewayRunner:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=resolve_all,
+            approval_kind="file_backend_local" if files_scope else None,
+        )
         if not count:
             return t("gateway.approve.no_pending")
 

@@ -1430,6 +1430,73 @@ def test_file_approval_session_all_does_not_leak_across_sessions(monkeypatch):
     approval_mod.clear_session(session_b)
 
 
+def test_file_approval_permanent_file_allowlist_entries_are_ignored(monkeypatch):
+    """Stale command_allowlist file:* entries must not bypass local file approval."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-stale-file-perm"
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+    with approval_mod._lock:
+        approval_mod._permanent_approved.add("file:backend:local:any")
+        approval_mod._permanent_approved.add("file:read_file")
+
+    token = approval_mod.set_current_session_key(session_key)
+    try:
+        result = approval_mod.check_file_operation_approval(
+            tool_name="read_file", operation="read", path="/etc/hostname",
+        )
+    finally:
+        approval_mod.reset_current_session_key(token)
+        with approval_mod._lock:
+            approval_mod._permanent_approved.discard("file:backend:local:any")
+            approval_mod._permanent_approved.discard("file:read_file")
+        approval_mod.clear_session(session_key)
+
+    assert result.get("approved") is False
+    assert result.get("status") == "pending_approval"
+    assert result.get("approval_kind") == "file_backend_local"
+
+
+def test_resolve_gateway_approval_filters_file_session_all_by_kind():
+    """A file-only approval choice must not resolve queued dangerous commands."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-kind-filter"
+    dangerous = approval_mod._ApprovalEntry({
+        "command": "rm -rf /tmp/example",
+        "description": "dangerous command",
+        "pattern_key": "dangerous:rm-rf",
+    })
+    file_entry = approval_mod._ApprovalEntry({
+        "command": "read_file(path='/etc/hostname', backend='local')",
+        "description": "local file read",
+        "pattern_key": "file:read_file",
+        "approval_kind": "file_backend_local",
+    })
+
+    with approval_mod._lock:
+        approval_mod._gateway_queues[session_key] = [dangerous, file_entry]
+
+    count = approval_mod.resolve_gateway_approval(
+        session_key,
+        "session_all",
+        resolve_all=True,
+        approval_kind="file_backend_local",
+    )
+
+    assert count == 1
+    assert dangerous.result is None
+    assert not dangerous.event.is_set()
+    assert file_entry.result == "session_all"
+    assert file_entry.event.is_set()
+    with approval_mod._lock:
+        assert approval_mod._gateway_queues[session_key] == [dangerous]
+        approval_mod._gateway_queues.pop(session_key, None)
+
+
 def test_file_approval_session_all_does_not_affect_dangerous_commands(monkeypatch):
     """session_all must NOT auto-approve dangerous command patterns."""
     from tools import approval as approval_mod
