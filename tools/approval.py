@@ -1430,5 +1430,180 @@ def check_all_command_guards(command: str, env_type: str,
             "user_approved": True, "description": combined_desc}
 
 
+def check_file_operation_approval(
+    tool_name: str,
+    operation: str,
+    path: str,
+) -> dict:
+    """Check whether a local file operation needs user approval.
+
+    Called from file_tools when ``backend='local'`` is requested while the
+    configured terminal backend is Docker (a sandbox-escape scenario).
+    Uses the same blocking gateway approval queue as dangerous-command
+    checks so ``/approve`` and ``/deny`` work identically.
+
+    Returns ``{"approved": True}`` when safe or
+    ``{"approved": False, "error": "..."}`` when blocked.
+    """
+    approval_mode = _get_approval_mode()
+    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
+        return {"approved": True}
+
+    description = f"Local filesystem {operation} by {tool_name} at {path!r}"
+
+    is_cli = env_var_enabled("HERMES_INTERACTIVE")
+    is_gateway = _is_gateway_approval_context()
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
+
+    if is_cli:
+        return {"approved": True}
+
+    session_key = get_current_session_key()
+
+    if is_gateway or is_ask:
+        notify_cb = None
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+
+        if notify_cb is not None:
+            approval_data = {
+                "command": f"{tool_name}(path={path!r}, backend='local')",
+                "description": description,
+                "pattern_key": f"file:{tool_name}",
+                "pattern_keys": [f"file:{tool_name}"],
+            }
+            entry = _ApprovalEntry(approval_data)
+            with _lock:
+                _gateway_queues.setdefault(session_key, []).append(entry)
+
+            _fire_approval_hook(
+                "pre_approval_request",
+                command=approval_data["command"],
+                description=description,
+                pattern_key=approval_data["pattern_key"],
+                pattern_keys=approval_data["pattern_keys"],
+                session_key=session_key,
+                surface="gateway",
+            )
+
+            try:
+                notify_cb(approval_data)
+            except Exception as exc:
+                logger.warning("File operation approval notify failed: %s", exc)
+                with _lock:
+                    queue = _gateway_queues.get(session_key, [])
+                    if entry in queue:
+                        queue.remove(entry)
+                    if not queue:
+                        _gateway_queues.pop(session_key, None)
+                return {
+                    "approved": False,
+                    "error": (
+                        f"Local file {operation} denied: failed to request user approval. "
+                        f"The configured terminal backend is Docker, but "
+                        f"{tool_name} requested backend='local'."
+                    ),
+                }
+
+            timeout = _get_approval_config().get("gateway_timeout", 300)
+            try:
+                timeout = int(timeout)
+            except (ValueError, TypeError):
+                timeout = 300
+
+            try:
+                from tools.environments.base import touch_activity_if_due
+            except Exception:
+                touch_activity_if_due = None
+
+            _now = time.monotonic()
+            _deadline = _now + max(timeout, 0)
+            _activity_state = {"last_touch": _now, "start": _now}
+            resolved = False
+            while True:
+                _remaining = _deadline - time.monotonic()
+                if _remaining <= 0:
+                    break
+                if entry.event.wait(timeout=min(1.0, _remaining)):
+                    resolved = True
+                    break
+                if touch_activity_if_due is not None:
+                    touch_activity_if_due(
+                        _activity_state, "waiting for user approval"
+                    )
+
+            with _lock:
+                queue = _gateway_queues.get(session_key, [])
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+
+            choice = entry.result
+            _outcome = (
+                "timeout" if not resolved
+                else (choice if choice else "timeout")
+            )
+            _fire_approval_hook(
+                "post_approval_response",
+                command=approval_data["command"],
+                description=description,
+                pattern_key=approval_data["pattern_key"],
+                pattern_keys=approval_data["pattern_keys"],
+                session_key=session_key,
+                surface="gateway",
+                choice=_outcome,
+            )
+
+            if not resolved or choice is None or choice == "deny":
+                reason = (
+                    "timed out without user response" if not resolved
+                    else "denied by user"
+                )
+                return {
+                    "approved": False,
+                    "error": (
+                        f"Local file {operation} {reason}. The configured "
+                        f"terminal backend is Docker, but {tool_name} "
+                        f"requested backend='local' for {path!r}. "
+                        f"Use /approve to allow this operation, or "
+                        f"rephrase to avoid local filesystem access."
+                    ),
+                }
+
+            return {"approved": True, "user_approved": True}
+
+        approval_payload = {
+            "command": f"{tool_name}(path={path!r}, backend='local')",
+            "pattern_key": f"file:{tool_name}",
+            "pattern_keys": [f"file:{tool_name}"],
+            "description": description,
+        }
+        submit_pending(session_key, approval_payload)
+        return {
+            "approved": False,
+            "error": (
+                f"Local file {operation} requires approval. The configured "
+                f"terminal backend is Docker, but {tool_name} requested "
+                f"backend='local' for {path!r}. Use /approve to allow "
+                f"this operation."
+            ),
+            "status": "pending_approval",
+            **approval_payload,
+        }
+
+    return {
+        "approved": False,
+        "error": (
+            f"Local file {operation} blocked: the configured terminal backend "
+            f"is Docker, but {tool_name} requested backend='local' for "
+            f"{path!r}. File operations on the local filesystem are blocked "
+            f"in non-interactive contexts. Use /approve in interactive "
+            f"sessions, or set terminal.backend to 'local' if you need "
+            f"unrestricted filesystem access."
+        ),
+    }
+
+
 # Load permanent allowlist from config on module import
 load_permanent_allowlist()
