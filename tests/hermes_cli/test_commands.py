@@ -116,6 +116,13 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
+    def test_context_dump_is_gateway_command(self):
+        context_dump = resolve_command("context-dump")
+        assert context_dump is not None
+        assert context_dump.name == "context-dump"
+        assert context_dump.gateway_only is True
+        assert "context-dump" in GATEWAY_KNOWN_COMMANDS
+
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
