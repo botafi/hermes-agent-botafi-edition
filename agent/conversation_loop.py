@@ -128,6 +128,8 @@ def _record_context_dump_snapshot(
     total_chars: int,
 ) -> None:
     """Store the last exact provider request for gateway /context-dump."""
+    if not getattr(agent, "_context_dump_enabled", False):
+        return
     try:
         snapshot = {
             "schema_version": 1,
@@ -1160,13 +1162,14 @@ def run_conversation(
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
-                _record_context_dump_snapshot(
-                    agent,
-                    api_kwargs=api_kwargs,
-                    api_call_count=api_call_count,
-                    approx_tokens=approx_tokens,
-                    total_chars=total_chars,
-                )
+                if getattr(agent, "_context_dump_enabled", False):
+                    _record_context_dump_snapshot(
+                        agent,
+                        api_kwargs=api_kwargs,
+                        api_call_count=api_call_count,
+                        approx_tokens=approx_tokens,
+                        total_chars=total_chars,
+                    )
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook

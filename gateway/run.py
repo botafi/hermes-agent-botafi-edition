@@ -13929,10 +13929,7 @@ class GatewayRunner:
         dump_path = dump_dir / f"context-dump-{safe_session_id}-{timestamp}.json"
 
         def _write_dump() -> None:
-            dump_path.write_text(
-                json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            atomic_json_write(dump_path, snapshot, indent=2, sort_keys=True)
 
         await asyncio.to_thread(_write_dump)
 
@@ -15858,6 +15855,9 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        context_dump_enabled = bool(
+            cfg_get(user_config, "gateway", "context_dump", "enabled", default=False)
+        )
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -16739,6 +16739,12 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent._context_dump_enabled = context_dump_enabled
+            if not context_dump_enabled and hasattr(agent, "_last_context_dump_snapshot"):
+                try:
+                    delattr(agent, "_last_context_dump_snapshot")
+                except Exception:
+                    pass
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

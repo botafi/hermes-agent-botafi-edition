@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -98,6 +99,7 @@ def test_record_context_dump_snapshot_stores_metadata_and_sanitized_payload():
         model="gpt-5.1-codex",
         api_mode="codex_responses",
         base_url="https://chatgpt.com/backend-api/codex",
+        _context_dump_enabled=True,
     )
 
     _record_context_dump_snapshot(
@@ -122,6 +124,20 @@ def test_record_context_dump_snapshot_stores_metadata_and_sanitized_payload():
     assert snapshot["request_char_count"] == 168
     assert snapshot["payload"]["input"][0]["content"] == "hi"
     assert "authorization" not in snapshot["payload"]["extra_headers"]
+
+
+def test_record_context_dump_snapshot_is_noop_when_disabled():
+    agent = SimpleNamespace(_context_dump_enabled=False)
+
+    _record_context_dump_snapshot(
+        agent,
+        api_kwargs={"messages": [{"role": "user", "content": "hi"}]},
+        api_call_count=1,
+        approx_tokens=1,
+        total_chars=2,
+    )
+
+    assert not hasattr(agent, "_last_context_dump_snapshot")
 
 
 @pytest.mark.asyncio
@@ -179,3 +195,4 @@ async def test_context_dump_command_writes_json_and_uploads(monkeypatch, tmp_pat
 
     on_disk = json.loads(dump_path.read_text(encoding="utf-8"))
     assert on_disk == snapshot
+    assert stat.S_IMODE(dump_path.stat().st_mode) == 0o600
