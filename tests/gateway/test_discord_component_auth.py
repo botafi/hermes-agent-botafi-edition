@@ -12,7 +12,9 @@ These tests pin the user-or-role OR semantics and the fail-closed
 behavior on missing role data so the parity cannot regress.
 """
 
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -156,6 +158,40 @@ def test_exec_approval_view_role_default_is_empty_set():
     assert view.allowed_role_ids == set()
     assert view._check_auth(_interaction(11111)) is True
     assert view._check_auth(_interaction(99999)) is False
+
+
+def test_exec_approval_view_file_allow_all_filters_by_approval_kind(monkeypatch):
+    """Discord's file-tool Allow All button must resolve only file approvals."""
+    calls = []
+
+    def fake_resolve_gateway_approval(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 2
+
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        fake_resolve_gateway_approval,
+    )
+
+    view = ExecApprovalView(
+        session_key="sess-file",
+        allowed_user_ids={"11111"},
+        approval_kind="file_backend_local",
+    )
+    embed = SimpleNamespace(color=None, set_footer=lambda **_kwargs: None)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=11111, display_name="Filip", roles=[]),
+        message=SimpleNamespace(embeds=[embed]),
+        response=SimpleNamespace(edit_message=AsyncMock()),
+    )
+
+    asyncio.run(view.allow_always(interaction, button=SimpleNamespace()))
+
+    assert calls == [(
+        ("sess-file", "session_all"),
+        {"resolve_all": True, "approval_kind": "file_backend_local"},
+    )]
+    interaction.response.edit_message.assert_awaited_once()
 
 
 def test_slash_confirm_view_accepts_role_allowlist():

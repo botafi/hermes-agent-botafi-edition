@@ -25,3 +25,16 @@ File tools (`read_file`, `write_file`, `patch`, `search_files`) now accept an op
 If the configured default backend is Docker and a file tool explicitly requests `backend="local"`, the operation is routed through the approval flow instead of silently escaping the sandbox. This applies to both read-style and mutation-style local file operations. Docker/default file operations remain sandboxed and do not require local approval.
 
 The `execute_code` sandbox intentionally does not expose the `backend` override, so sandboxed Python cannot request local file or terminal access.
+
+#### Approval UX and scoping hardening
+
+Local-backend file approvals are now scoped as their own approval kind (`file_backend_local`) instead of sharing the generic dangerous-command approval bucket. This keeps file-tool approval choices from accidentally resolving unrelated pending command approvals in the same gateway session.
+
+Gateway UIs expose file-specific approval choices:
+
+- **Allow Session** approves future local-backend calls for the same file tool type, such as `read_file`.
+- **Allow All File Tools** approves local-backend access for all file tools for the current session only.
+
+File-tool approval checks intentionally consult session approvals only. Stale permanent `command_allowlist` entries such as `file:*` or `file:backend:local:any` do not bypass the local filesystem escape-hatch approval.
+
+Concurrent same-type prompts are also coalesced: approving one queued local-backend `read_file` prompt for the session resolves sibling queued `read_file` prompts, while different file tools and dangerous-command prompts remain pending for separate decisions.
