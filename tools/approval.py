@@ -558,18 +558,43 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        def _matching_kind(entry: _ApprovalEntry) -> bool:
+            return approval_kind is None or entry.data.get("approval_kind") == approval_kind
+
+        def _pattern_keys(entry: _ApprovalEntry) -> set[str]:
+            keys = set(entry.data.get("pattern_keys") or [])
+            if entry.data.get("pattern_key"):
+                keys.add(entry.data["pattern_key"])
+            return keys
+
         if approval_kind is not None:
-            matching = [entry for entry in queue if entry.data.get("approval_kind") == approval_kind]
+            matching = [entry for entry in queue if _matching_kind(entry)]
             if not matching:
                 return 0
             targets = matching if resolve_all else [matching[0]]
-            for entry in targets:
-                queue.remove(entry)
         elif resolve_all:
             targets = list(queue)
-            queue.clear()
         else:
-            targets = [queue.pop(0)]
+            targets = [queue[0]]
+
+        # UX: if the user chooses a session-scoped approval while multiple
+        # concurrent requests of the same type are queued, resolve the matching
+        # siblings too.  Example: two parallel read_file(..., backend='local')
+        # prompts should both unblock when the first is approved for session,
+        # while still leaving unrelated dangerous-command or different file-tool
+        # approvals pending for an explicit decision.
+        if not resolve_all and choice in {"session", "session_all"}:
+            target_keys = _pattern_keys(targets[0])
+            if target_keys:
+                for entry in list(queue):
+                    if entry in targets or not _matching_kind(entry):
+                        continue
+                    if _pattern_keys(entry) & target_keys:
+                        targets.append(entry)
+
+        for entry in targets:
+            if entry in queue:
+                queue.remove(entry)
         if not queue:
             _gateway_queues.pop(session_key, None)
 
