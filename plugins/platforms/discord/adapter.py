@@ -3042,8 +3042,8 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_restart(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/restart", "Restart requested~")
 
-        @tree.command(name="approve", description="Approve a pending dangerous command")
-        @discord.app_commands.describe(scope="Optional: 'all', 'session', 'always', 'all session', 'all always'")
+        @tree.command(name="approve", description="Approve a pending command or file access request")
+        @discord.app_commands.describe(scope="Optional: 'session', 'files', 'always', 'all', 'all session', 'all always'")
         async def slash_approve(interaction: discord.Interaction, scope: str = ""):
             await self._run_simple_slash(interaction, f"/approve {scope}".strip())
 
@@ -4064,6 +4064,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 session_key=session_key,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                approval_kind=(metadata or {}).get("approval_kind"),
             )
 
             msg = await channel.send(embed=embed, view=view)
@@ -5018,12 +5019,19 @@ def _define_discord_view_classes() -> None:
             session_key: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            approval_kind: Optional[str] = None,
         ):
             super().__init__(timeout=300)  # 5-minute timeout
             self.session_key = session_key
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.approval_kind = approval_kind
             self.resolved = False
+            if approval_kind == "file_backend_local":
+                for child in self.children:
+                    if getattr(child, "label", None) == "Always Allow":
+                        child.label = "Allow All File Tools"
+                        child.style = discord.ButtonStyle.blurple
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized."""
@@ -5089,6 +5097,14 @@ def _define_discord_view_classes() -> None:
         async def allow_always(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
+            if self.approval_kind == "file_backend_local":
+                await self._resolve(
+                    interaction,
+                    "session_all",
+                    discord.Color.blue(),
+                    "Approved all file tools for session",
+                )
+                return
             await self._resolve(interaction, "always", discord.Color.purple(), "Approved permanently")
 
         @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
