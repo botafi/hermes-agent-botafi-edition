@@ -1961,6 +1961,12 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
+        # Upload the full last-provider-request payload with /context-dump.
+        # Disabled by default because dumps include private conversation and
+        # tool context. Auth material is still stripped before writing.
+        "context_dump": {
+            "enabled": False,
+        },
     },
 
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
