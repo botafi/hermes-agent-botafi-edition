@@ -1460,6 +1460,50 @@ def test_file_approval_permanent_file_allowlist_entries_are_ignored(monkeypatch)
     assert result.get("approval_kind") == "file_backend_local"
 
 
+def test_resolve_gateway_approval_session_resolves_same_pattern_siblings():
+    """Session approval resolves concurrent same-tool prompts of the same type."""
+    from tools import approval as approval_mod
+
+    session_key = "gw-test-session-siblings"
+    read_one = approval_mod._ApprovalEntry({
+        "command": "read_file(path='/etc/hostname', backend='local')",
+        "description": "local file read one",
+        "pattern_key": "file:read_file",
+        "pattern_keys": ["file:read_file"],
+        "approval_kind": "file_backend_local",
+    })
+    read_two = approval_mod._ApprovalEntry({
+        "command": "read_file(path='/etc/hosts', backend='local')",
+        "description": "local file read two",
+        "pattern_key": "file:read_file",
+        "pattern_keys": ["file:read_file"],
+        "approval_kind": "file_backend_local",
+    })
+    write_entry = approval_mod._ApprovalEntry({
+        "command": "write_file(path='/tmp/x', backend='local')",
+        "description": "local file write",
+        "pattern_key": "file:write_file",
+        "pattern_keys": ["file:write_file"],
+        "approval_kind": "file_backend_local",
+    })
+
+    with approval_mod._lock:
+        approval_mod._gateway_queues[session_key] = [read_one, read_two, write_entry]
+
+    count = approval_mod.resolve_gateway_approval(session_key, "session")
+
+    assert count == 2
+    assert read_one.result == "session"
+    assert read_one.event.is_set()
+    assert read_two.result == "session"
+    assert read_two.event.is_set()
+    assert write_entry.result is None
+    assert not write_entry.event.is_set()
+    with approval_mod._lock:
+        assert approval_mod._gateway_queues[session_key] == [write_entry]
+        approval_mod._gateway_queues.pop(session_key, None)
+
+
 def test_resolve_gateway_approval_filters_file_session_all_by_kind():
     """A file-only approval choice must not resolve queued dangerous commands."""
     from tools import approval as approval_mod
