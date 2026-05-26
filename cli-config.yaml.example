@@ -105,6 +105,120 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
+# Hosted Tool Search / Tool Namespaces (Responses API)
+# =============================================================================
+# Supported OpenAI Responses models can search deferred tools instead of seeing
+# every tool schema up front. Hermes keeps "always present" tools visible and
+# groups the rest into short namespaces. OpenAI-compatible proxies are off by
+# default unless you explicitly enable them here.
+#
+# tools:
+#   hosted_search:
+#     enabled: auto   # auto | true | false
+#     default_always_present:
+#       - send_message
+#       - terminal
+#       - process
+#       - execute_code
+#       - session_search
+#     providers:
+#       openai-api:
+#         enabled: auto
+#         model_allow: ["gpt-5.4*", "gpt-5.5*", "gpt-6*"]
+#         model_deny: ["gpt-5.4-nano*"]
+#       openai-codex:
+#         enabled: auto
+#         model_allow: ["gpt-5.4*", "gpt-5.5*", "gpt-6*"]
+#         model_deny: ["gpt-5.4-nano*"]
+#       # Example: opt in an OpenAI-compatible proxy only after you know it
+#       # forwards tool_search / namespace / defer_loading correctly.
+#       # gmi:
+#       #   enabled: true
+#       #   model_allow: ["openai/gpt-5.4*"]
+#     namespaces:
+#       automation:  {description: "Scheduled jobs, delegation, and multi-agent coordination."}
+#       browser:     {description: "Browser navigation, page inspection, and interaction."}
+#       core:        {description: "Conversation control, task state, memory, and session search."}
+#       filesystem:  {description: "Read, search, write, and patch workspace files."}
+#       media:       {description: "Vision, image, video, and audio generation tools."}
+#       messaging:   {description: "Send messages through connected chat platforms."}
+#       skills:      {description: "Discover, inspect, and manage Hermes skills."}
+#       smart_home:  {description: "Inspect and control Home Assistant entities."}
+#       terminal:    {description: "Run shell commands, processes, and code sandboxes."}
+#       web:         {description: "Search the web and extract webpage content."}
+#       # MCP servers automatically use mcp_<server_name> and inherit
+#       # mcp_servers.<server_name>.description when set. Override any of
+#       # them here by adding that generated namespace, e.g.:
+#       # mcp_github: {description: "GitHub MCP repository and issue tools."}
+#     tool_overrides:
+#       # Every built-in tool can be configured by exact name:
+#       # send_message:     {namespace: messaging,  always_present: true}
+#       # terminal:         {namespace: terminal,   always_present: true}
+#       # process:          {namespace: terminal,   always_present: true}
+#       # execute_code:     {namespace: terminal,   always_present: true}
+#       # session_search:   {namespace: core,       always_present: true}
+#       # clarify:          {namespace: core,       always_present: false}
+#       # todo:             {namespace: core,       always_present: false}
+#       # memory:           {namespace: core,       always_present: false}
+#       # read_file:        {namespace: filesystem, always_present: false}
+#       # write_file:       {namespace: filesystem, always_present: false}
+#       # patch:            {namespace: filesystem, always_present: false}
+#       # search_files:     {namespace: filesystem, always_present: false}
+#       # web_search:       {namespace: web,        always_present: false}
+#       # web_extract:      {namespace: web,        always_present: false}
+#       # x_search:         {namespace: web,        always_present: false}
+#       # browser_navigate: {namespace: browser,    always_present: false}
+#       # browser_snapshot: {namespace: browser,    always_present: false}
+#       # browser_click:    {namespace: browser,    always_present: false}
+#       # browser_type:     {namespace: browser,    always_present: false}
+#       # browser_scroll:   {namespace: browser,    always_present: false}
+#       # browser_back:     {namespace: browser,    always_present: false}
+#       # browser_press:    {namespace: browser,    always_present: false}
+#       # browser_get_images: {namespace: browser,  always_present: false}
+#       # browser_vision:   {namespace: browser,    always_present: false}
+#       # browser_console:  {namespace: browser,    always_present: false}
+#       # browser_cdp:      {namespace: browser,    always_present: false}
+#       # browser_dialog:   {namespace: browser,    always_present: false}
+#       # vision_analyze:   {namespace: media,      always_present: false}
+#       # image_generate:   {namespace: media,      always_present: false}
+#       # video_analyze:    {namespace: media,      always_present: false}
+#       # video_generate:   {namespace: media,      always_present: false}
+#       # text_to_speech:   {namespace: media,      always_present: false}
+#       # skills_list:      {namespace: skills,     always_present: false}
+#       # skill_view:       {namespace: skills,     always_present: false}
+#       # skill_manage:     {namespace: skills,     always_present: false}
+#       # delegate_task:    {namespace: automation, always_present: false}
+#       # cronjob:          {namespace: automation, always_present: false}
+#       # kanban_show:      {namespace: automation, always_present: false}
+#       # kanban_list:      {namespace: automation, always_present: false}
+#       # kanban_complete:  {namespace: automation, always_present: false}
+#       # kanban_block:     {namespace: automation, always_present: false}
+#       # kanban_heartbeat: {namespace: automation, always_present: false}
+#       # kanban_comment:   {namespace: automation, always_present: false}
+#       # kanban_create:    {namespace: automation, always_present: false}
+#       # kanban_link:      {namespace: automation, always_present: false}
+#       # kanban_unblock:   {namespace: automation, always_present: false}
+#       # computer_use:     {namespace: browser,    always_present: false}
+#       # ha_list_entities: {namespace: smart_home, always_present: false}
+#       # ha_get_state:     {namespace: smart_home, always_present: false}
+#       # ha_list_services: {namespace: smart_home, always_present: false}
+#       # ha_call_service:  {namespace: smart_home, always_present: false}
+#       # discord:         {namespace: messaging,  always_present: false}
+#       # discord_admin:   {namespace: messaging,  always_present: false}
+#       # feishu_doc_read: {namespace: messaging,  always_present: false}
+#       # feishu_drive_list_comments: {namespace: messaging, always_present: false}
+#       # feishu_drive_list_comment_replies: {namespace: messaging, always_present: false}
+#       # feishu_drive_reply_comment: {namespace: messaging, always_present: false}
+#       # feishu_drive_add_comment: {namespace: messaging, always_present: false}
+#       # yb_query_group_info: {namespace: messaging, always_present: false}
+#       # yb_query_group_members: {namespace: messaging, always_present: false}
+#       # yb_send_dm:       {namespace: messaging,  always_present: false}
+#       # yb_search_sticker: {namespace: messaging, always_present: false}
+#       # yb_send_sticker:  {namespace: messaging,  always_present: false}
+#       # MCP tools can also be overridden by their generated exact tool name:
+#       # mcp_github_search_repositories: {namespace: mcp_github, always_present: false}
+
+# =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
 # =============================================================================
 # Control how requests are routed across providers on OpenRouter.
@@ -780,19 +894,24 @@ platform_toolsets:
 #   headers: HTTP headers (e.g., for authentication)
 #
 # Optional per-server settings:
+#   description: short description for listings and hosted tool-search namespaces
 #   timeout: tool call timeout in seconds (default: 120)
 #   connect_timeout: initial connection timeout (default: 60)
 #
 # mcp_servers:
 #   time:
+#     description: "Time and timezone conversion tools."
 #     command: uvx
 #     args: ["mcp-server-time"]
 #   filesystem:
+#     description: "Read and manage files exposed by the filesystem MCP server."
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
 #   notion:
+#     description: "Search and update Notion workspace content."
 #     url: https://mcp.notion.com/mcp
 #   github:
+#     description: "GitHub repository, issue, and pull request tools."
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-github"]
 #     env:

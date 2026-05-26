@@ -202,24 +202,112 @@ def _derive_responses_function_call_id(
 # Schema conversion
 # ---------------------------------------------------------------------------
 
-def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
-    """Convert chat-completions tool schemas to Responses function-tool schemas."""
+def _responses_function_tool_from_chat_tool(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Convert one chat-completions function schema to a Responses function tool."""
+    fn = item.get("function", {}) if isinstance(item, dict) else {}
+    name = fn.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return {
+        "type": "function",
+        "name": name.strip(),
+        "description": fn.get("description", ""),
+        "strict": False,
+        "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+    }
+
+
+def _responses_namespace_description(
+    namespace: str,
+    _tools: List[Dict[str, Any]],
+    configured_description: str = "",
+) -> str:
+    base = configured_description.strip() if configured_description else ""
+    if not base:
+        if namespace.startswith("mcp_"):
+            base = f"Tools from the {namespace[len('mcp_'):].replace('_', ' ')} MCP server."
+        else:
+            base = f"{namespace.replace('_', ' ').title()} tools."
+    return base
+
+
+def _responses_tools(
+    tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    hosted_tool_search: bool = False,
+) -> Optional[List[Dict[str, Any]]]:
+    """Convert chat-completions tool schemas to Responses tool schemas.
+
+    When ``hosted_tool_search`` is enabled, tools that are not marked
+    always-present are grouped into Responses namespaces with
+    ``defer_loading=true``. MCP tools naturally become one namespace per
+    connected server (``mcp_<server>``).
+    """
     if not tools:
         return None
 
     converted: List[Dict[str, Any]] = []
+    namespaces: Dict[str, Dict[str, Any]] = {}
+    hosted_search_config = None
+    if hosted_tool_search:
+        try:
+            from hermes_cli.config import load_config
+
+            hosted_search_config = load_config() or {}
+        except Exception:
+            hosted_search_config = {}
     for item in tools:
-        fn = item.get("function", {}) if isinstance(item, dict) else {}
-        name = fn.get("name")
-        if not isinstance(name, str) or not name.strip():
+        converted_tool = _responses_function_tool_from_chat_tool(item)
+        if converted_tool is None:
             continue
-        converted.append({
-            "type": "function",
-            "name": name,
-            "description": fn.get("description", ""),
-            "strict": False,
-            "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-        })
+
+        if hosted_tool_search:
+            metadata = {}
+            try:
+                from tools.registry import registry
+
+                metadata = registry.get_hosted_search_metadata(
+                    converted_tool["name"],
+                    config=hosted_search_config,
+                )
+            except Exception:
+                metadata = {}
+            if not bool(metadata.get("always_present")):
+                namespace = str(metadata.get("namespace") or "tools").strip() or "tools"
+                namespace = re.sub(r"[^A-Za-z0-9_]", "_", namespace).strip("_") or "tools"
+                deferred = dict(converted_tool)
+                deferred["defer_loading"] = True
+                bucket = namespaces.setdefault(
+                    namespace,
+                    {
+                        "description": str(metadata.get("namespace_description") or "").strip(),
+                        "tools": [],
+                    },
+                )
+                bucket["tools"].append(deferred)
+                continue
+
+        converted.append(converted_tool)
+
+    if hosted_tool_search and namespaces:
+        namespace_tools = []
+        for namespace in sorted(namespaces):
+            bucket = namespaces[namespace]
+            tools_for_namespace = bucket["tools"]
+            namespace_tools.append(
+                {
+                    "type": "namespace",
+                    "name": namespace,
+                    "description": _responses_namespace_description(
+                        namespace,
+                        tools_for_namespace,
+                        bucket.get("description", ""),
+                    ),
+                    "tools": tools_for_namespace,
+                }
+            )
+        converted = [{"type": "tool_search"}] + converted + namespace_tools
+
     return converted or None
 
 
@@ -370,6 +458,21 @@ def _chat_messages_to_responses_input(
                     # following item.
                     items.append({"role": "assistant", "content": ""})
 
+                # Replay hosted/client tool-search records before any function
+                # calls that depend on the loaded deferred tools. Hermes uses
+                # store=False and rebuilds Responses input every turn, so these
+                # items must be preserved in history for deferred namespace
+                # function_call replay to remain valid.
+                codex_tool_search_items = msg.get("codex_tool_search_items")
+                if isinstance(codex_tool_search_items, list):
+                    for raw_item in codex_tool_search_items:
+                        if not isinstance(raw_item, dict):
+                            continue
+                        item_type = raw_item.get("type")
+                        if item_type not in {"tool_search_call", "tool_search_output"}:
+                            continue
+                        items.append(dict(raw_item))
+
                 tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
                     for tc in tool_calls:
@@ -411,6 +514,9 @@ def _chat_messages_to_responses_input(
                             "name": fn_name,
                             "arguments": arguments,
                         })
+                        namespace = tc.get("namespace")
+                        if isinstance(namespace, str) and namespace.strip():
+                            items[-1]["namespace"] = namespace.strip()
                 continue
 
             # Non-assistant (user) role: emit multimodal parts when present,
@@ -487,14 +593,54 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 arguments = str(arguments)
             arguments = arguments.strip() or "{}"
 
-            normalized.append(
-                {
-                    "type": "function_call",
-                    "call_id": call_id.strip(),
-                    "name": name.strip(),
-                    "arguments": arguments,
-                }
-            )
+            normalized_call = {
+                "type": "function_call",
+                "call_id": call_id.strip(),
+                "name": name.strip(),
+                "arguments": arguments,
+            }
+            namespace = item.get("namespace")
+            if isinstance(namespace, str) and namespace.strip():
+                normalized_call["namespace"] = namespace.strip()
+            normalized.append(normalized_call)
+            continue
+
+        if item_type == "tool_search_call":
+            normalized_item: Dict[str, Any] = {"type": "tool_search_call"}
+            execution = item.get("execution")
+            if isinstance(execution, str) and execution.strip():
+                normalized_item["execution"] = execution.strip()
+            call_id = item.get("call_id")
+            if call_id is None:
+                normalized_item["call_id"] = None
+            elif isinstance(call_id, str):
+                normalized_item["call_id"] = call_id.strip()
+            status = item.get("status")
+            if isinstance(status, str) and status.strip():
+                normalized_item["status"] = status.strip()
+            arguments = item.get("arguments")
+            if isinstance(arguments, dict):
+                normalized_item["arguments"] = arguments
+            normalized.append(normalized_item)
+            continue
+
+        if item_type == "tool_search_output":
+            normalized_item = {"type": "tool_search_output"}
+            execution = item.get("execution")
+            if isinstance(execution, str) and execution.strip():
+                normalized_item["execution"] = execution.strip()
+            call_id = item.get("call_id")
+            if call_id is None:
+                normalized_item["call_id"] = None
+            elif isinstance(call_id, str):
+                normalized_item["call_id"] = call_id.strip()
+            status = item.get("status")
+            if isinstance(status, str) and status.strip():
+                normalized_item["status"] = status.strip()
+            tools = item.get("tools")
+            if isinstance(tools, list):
+                normalized_item["tools"] = _preflight_codex_tools(tools, label=f"input[{idx}].tools")
+            normalized.append(normalized_item)
             continue
 
         if item_type == "function_call_output":
@@ -671,6 +817,103 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _preflight_codex_function_tool(tool: Dict[str, Any], *, label: str) -> Dict[str, Any]:
+    name = tool.get("name")
+    parameters = tool.get("parameters")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"Codex Responses {label} is missing a valid name.")
+    if not isinstance(parameters, dict):
+        raise ValueError(f"Codex Responses {label} is missing valid parameters.")
+
+    description = tool.get("description", "")
+    if description is None:
+        description = ""
+    if not isinstance(description, str):
+        description = str(description)
+
+    strict = tool.get("strict", False)
+    if not isinstance(strict, bool):
+        strict = bool(strict)
+
+    normalized = {
+        "type": "function",
+        "name": name.strip(),
+        "description": description,
+        "strict": strict,
+        "parameters": parameters,
+    }
+    if tool.get("defer_loading") is not None:
+        normalized["defer_loading"] = bool(tool.get("defer_loading"))
+    return normalized
+
+
+def _preflight_codex_tools(raw_tools: Any, *, label: str = "tools") -> List[Dict[str, Any]]:
+    if not isinstance(raw_tools, list):
+        raise ValueError(f"Codex Responses request '{label}' must be a list when provided.")
+
+    normalized_tools: List[Dict[str, Any]] = []
+    for idx, tool in enumerate(raw_tools):
+        item_label = f"{label}[{idx}]"
+        if not isinstance(tool, dict):
+            raise ValueError(f"Codex Responses {item_label} must be an object.")
+
+        tool_type = tool.get("type")
+        if tool_type == "function":
+            normalized_tools.append(_preflight_codex_function_tool(tool, label=item_label))
+            continue
+
+        if tool_type == "namespace":
+            name = tool.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"Codex Responses {item_label} is missing a valid name.")
+            description = tool.get("description", "")
+            if description is None:
+                description = ""
+            if not isinstance(description, str):
+                description = str(description)
+            namespace_tools = tool.get("tools")
+            if not isinstance(namespace_tools, list):
+                raise ValueError(f"Codex Responses {item_label}.tools must be a list.")
+            normalized_namespace_tools = []
+            for tool_idx, ns_tool in enumerate(namespace_tools):
+                if not isinstance(ns_tool, dict):
+                    raise ValueError(
+                        f"Codex Responses {item_label}.tools[{tool_idx}] must be an object."
+                    )
+                normalized_namespace_tools.append(
+                    _preflight_codex_function_tool(ns_tool, label=f"{item_label}.tools[{tool_idx}]")
+                )
+            normalized_tools.append(
+                {
+                    "type": "namespace",
+                    "name": name.strip(),
+                    "description": description,
+                    "tools": normalized_namespace_tools,
+                }
+            )
+            continue
+
+        if tool_type == "tool_search":
+            normalized_tool: Dict[str, Any] = {"type": "tool_search"}
+            execution = tool.get("execution")
+            if isinstance(execution, str) and execution.strip():
+                normalized_tool["execution"] = execution.strip()
+            description = tool.get("description")
+            if isinstance(description, str) and description.strip():
+                normalized_tool["description"] = description.strip()
+            parameters = tool.get("parameters")
+            if parameters is not None:
+                if not isinstance(parameters, dict):
+                    raise ValueError(f"Codex Responses {item_label}.parameters must be an object.")
+                normalized_tool["parameters"] = parameters
+            normalized_tools.append(normalized_tool)
+            continue
+
+        raise ValueError(f"Codex Responses {item_label} has unsupported type {tool_type!r}.")
+
+    return normalized_tools
+
+
 def _preflight_codex_api_kwargs(
     api_kwargs: Any,
     *,
@@ -701,41 +944,7 @@ def _preflight_codex_api_kwargs(
     tools = api_kwargs.get("tools")
     normalized_tools = None
     if tools is not None:
-        if not isinstance(tools, list):
-            raise ValueError("Codex Responses request 'tools' must be a list when provided.")
-        normalized_tools = []
-        for idx, tool in enumerate(tools):
-            if not isinstance(tool, dict):
-                raise ValueError(f"Codex Responses tools[{idx}] must be an object.")
-            if tool.get("type") != "function":
-                raise ValueError(f"Codex Responses tools[{idx}] has unsupported type {tool.get('type')!r}.")
-
-            name = tool.get("name")
-            parameters = tool.get("parameters")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"Codex Responses tools[{idx}] is missing a valid name.")
-            if not isinstance(parameters, dict):
-                raise ValueError(f"Codex Responses tools[{idx}] is missing valid parameters.")
-
-            description = tool.get("description", "")
-            if description is None:
-                description = ""
-            if not isinstance(description, str):
-                description = str(description)
-
-            strict = tool.get("strict", False)
-            if not isinstance(strict, bool):
-                strict = bool(strict)
-
-            normalized_tools.append(
-                {
-                    "type": "function",
-                    "name": name.strip(),
-                    "description": description,
-                    "strict": strict,
-                    "parameters": parameters,
-                }
-            )
+        normalized_tools = _preflight_codex_tools(tools)
 
     store = api_kwargs.get("store", False)
     if store is not False:
@@ -872,6 +1081,44 @@ def _extract_responses_reasoning_text(item: Any) -> str:
     return ""
 
 
+def _plain_response_value(value: Any) -> Any:
+    """Convert SDK response objects into JSON-ish dict/list/scalar values."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_plain_response_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_plain_response_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(k): _plain_response_value(v)
+            for k, v in value.items()
+            if isinstance(k, (str, int, float, bool))
+        }
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _plain_response_value(model_dump(exclude_none=False))
+        except TypeError:
+            return _plain_response_value(model_dump())
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        return _plain_response_value(vars(value))
+    return str(value)
+
+
+def _extract_tool_search_item(item: Any) -> Optional[Dict[str, Any]]:
+    item_type = getattr(item, "type", None)
+    if item_type not in {"tool_search_call", "tool_search_output"}:
+        return None
+    raw = _plain_response_value(item)
+    if not isinstance(raw, dict):
+        return None
+    allowed = {"type", "execution", "call_id", "status", "arguments", "tools"}
+    return {key: raw.get(key) for key in allowed if key in raw}
+
+
 # ---------------------------------------------------------------------------
 # Full response normalization
 # ---------------------------------------------------------------------------
@@ -915,6 +1162,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
     reasoning_parts: List[str] = []
     reasoning_items_raw: List[Dict[str, Any]] = []
     message_items_raw: List[Dict[str, Any]] = []
+    tool_search_items_raw: List[Dict[str, Any]] = []
     tool_calls: List[Any] = []
     has_incomplete_items = response_status in {"queued", "in_progress", "incomplete"}
     saw_commentary_phase = False
@@ -994,10 +1242,12 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
             call_id = call_id.strip()
             response_item_id = raw_item_id if isinstance(raw_item_id, str) else None
             response_item_id = _derive_responses_function_call_id(call_id, response_item_id)
+            namespace = getattr(item, "namespace", None)
             tool_calls.append(SimpleNamespace(
                 id=call_id,
                 call_id=call_id,
                 response_item_id=response_item_id,
+                namespace=namespace if isinstance(namespace, str) and namespace else None,
                 type="function",
                 function=SimpleNamespace(name=fn_name, arguments=arguments),
             ))
@@ -1015,13 +1265,19 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
             call_id = call_id.strip()
             response_item_id = raw_item_id if isinstance(raw_item_id, str) else None
             response_item_id = _derive_responses_function_call_id(call_id, response_item_id)
+            namespace = getattr(item, "namespace", None)
             tool_calls.append(SimpleNamespace(
                 id=call_id,
                 call_id=call_id,
                 response_item_id=response_item_id,
+                namespace=namespace if isinstance(namespace, str) and namespace else None,
                 type="function",
                 function=SimpleNamespace(name=fn_name, arguments=arguments),
             ))
+        elif item_type in {"tool_search_call", "tool_search_output"}:
+            raw_tool_search_item = _extract_tool_search_item(item)
+            if raw_tool_search_item:
+                tool_search_items_raw.append(raw_tool_search_item)
 
     final_text = "\n".join([p for p in content_parts if p]).strip()
     if not final_text and hasattr(response, "output_text"):
@@ -1068,6 +1324,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
         codex_message_items=message_items_raw or None,
+        codex_tool_search_items=tool_search_items_raw or None,
     )
 
     if tool_calls:

@@ -77,6 +77,14 @@ class ProviderProfile:
     )
     # empty = use main model
 
+    # Hosted Responses tool_search support. Empty = no provider-profile
+    # opinion; config/default policy decides. Providers that are not real
+    # OpenAI but forward tool_search correctly can set "on" or "auto" with
+    # model allow/deny globs.
+    hosted_tool_search: str = ""
+    hosted_tool_search_model_allow: tuple = ()
+    hosted_tool_search_model_deny: tuple = ()
+
     # ── Hooks (override in subclass for complex providers) ───
 
     def get_hostname(self) -> str:
