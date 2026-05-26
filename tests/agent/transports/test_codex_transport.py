@@ -36,6 +36,212 @@ class TestCodexTransportBasic:
         assert result[0]["type"] == "function"
         assert result[0]["name"] == "terminal"
 
+    def test_hosted_tool_search_groups_mcp_toolset_as_namespace(self, transport):
+        from tools.registry import registry
+
+        schemas = [
+            {
+                "name": "mcp_unit_lookup",
+                "description": "Lookup a unit test value.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "mcp_unit_update",
+                "description": "Update a unit test value.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+        for schema in schemas:
+            registry.register(
+                name=schema["name"],
+                toolset="mcp-unit",
+                schema=schema,
+                handler=lambda *_a, **_k: "{}",
+            )
+        try:
+            tools = [
+                {"type": "function", "function": schema}
+                for schema in schemas
+            ] + [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "description": "Run a command",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            result = transport.build_kwargs(
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=tools,
+                is_codex_backend=True,
+                enable_hosted_tool_search=True,
+            )["tools"]
+
+            assert result[0] == {"type": "tool_search"}
+            assert any(t["type"] == "function" and t["name"] == "terminal" for t in result)
+            namespace = next(t for t in result if t["type"] == "namespace")
+            assert namespace["name"] == "mcp_unit"
+            assert "MCP server" in namespace["description"]
+            assert {t["name"] for t in namespace["tools"]} == {
+                "mcp_unit_lookup",
+                "mcp_unit_update",
+            }
+            assert all(t["defer_loading"] is True for t in namespace["tools"])
+        finally:
+            registry.deregister("mcp_unit_lookup")
+            registry.deregister("mcp_unit_update")
+
+    def test_hosted_tool_search_uses_mcp_server_description(self, monkeypatch):
+        import hermes_cli.config
+        from tools.registry import registry
+
+        monkeypatch.setattr(
+            hermes_cli.config,
+            "load_config",
+            lambda: {
+                "mcp_servers": {
+                    "unit-server": {
+                        "description": "Unit MCP lookup and update tools.",
+                    },
+                },
+                "tools": {"hosted_search": {}},
+            },
+        )
+        registry.register(
+            name="mcp_unit_server_lookup",
+            toolset="mcp-unit-server",
+            schema={
+                "name": "mcp_unit_server_lookup",
+                "description": "Lookup.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda *_a, **_k: "{}",
+        )
+        try:
+            metadata = registry.get_hosted_search_metadata("mcp_unit_server_lookup")
+            assert metadata["namespace"] == "mcp_unit_server"
+            assert metadata["namespace_description"] == "Unit MCP lookup and update tools."
+        finally:
+            registry.deregister("mcp_unit_server_lookup")
+
+    def test_hosted_tool_search_loads_config_once_per_request(self, transport, monkeypatch):
+        import hermes_cli.config
+        from tools.registry import registry
+
+        calls = {"count": 0}
+
+        def fake_load_config():
+            calls["count"] += 1
+            return {"tools": {"hosted_search": {}}}
+
+        monkeypatch.setattr(hermes_cli.config, "load_config", fake_load_config)
+
+        schemas = [
+            {
+                "name": "mcp_config_once_lookup",
+                "description": "Lookup.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "mcp_config_once_update",
+                "description": "Update.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+        for schema in schemas:
+            registry.register(
+                name=schema["name"],
+                toolset="mcp-config-once",
+                schema=schema,
+                handler=lambda *_a, **_k: "{}",
+            )
+        try:
+            transport.build_kwargs(
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=[{"type": "function", "function": schema} for schema in schemas],
+                is_codex_backend=True,
+                enable_hosted_tool_search=True,
+            )
+            assert calls["count"] == 1
+        finally:
+            registry.deregister("mcp_config_once_lookup")
+            registry.deregister("mcp_config_once_update")
+
+    def test_chat_message_conversion_replays_tool_search_before_function_call(self):
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_tool_search_items": [
+                    {
+                        "type": "tool_search_call",
+                        "execution": "server",
+                        "call_id": None,
+                        "status": "completed",
+                        "arguments": {"paths": ["unit"]},
+                    },
+                    {
+                        "type": "tool_search_output",
+                        "execution": "server",
+                        "call_id": None,
+                        "status": "completed",
+                        "tools": [],
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_abc123",
+                        "call_id": "call_abc123",
+                        "type": "function",
+                        "namespace": "unit",
+                        "function": {"name": "mcp_unit_lookup", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+        items = _chat_messages_to_responses_input(messages)
+        assert [item["type"] for item in items] == [
+            "tool_search_call",
+            "tool_search_output",
+            "function_call",
+        ]
+        assert items[-1]["namespace"] == "unit"
+
+    def test_hosted_tool_search_provider_gate_defaults_to_off_for_lookalikes(self):
+        from agent.hosted_tool_search import provider_supports_hosted_tool_search
+
+        assert provider_supports_hosted_tool_search(
+            provider="openai-api",
+            model="gpt-5.4",
+            base_url="https://api.openai.com/v1",
+        ) is True
+        assert provider_supports_hosted_tool_search(
+            provider="openai-codex",
+            model="gpt-5.4-mini",
+            base_url="https://chatgpt.com/backend-api/codex",
+        ) is True
+        assert provider_supports_hosted_tool_search(
+            provider="openai-api",
+            model="gpt-5.4-nano",
+            base_url="https://api.openai.com/v1",
+        ) is False
+        assert provider_supports_hosted_tool_search(
+            provider="openai-api",
+            model="gpt-5.4",
+            base_url="https://api.gmi-serving.com/v1",
+        ) is False
+        assert provider_supports_hosted_tool_search(
+            provider="gmi",
+            model="openai/gpt-5.4",
+            base_url="https://api.gmi-serving.com/v1",
+        ) is False
+
 
 class TestCodexBuildKwargs:
 
@@ -53,6 +259,67 @@ class TestCodexBuildKwargs:
         assert kw["instructions"] == "You are helpful."
         assert "input" in kw
         assert kw["store"] is False
+
+    def test_preflight_accepts_tool_search_namespace_and_replay_items(self, transport):
+        kw = {
+            "model": "gpt-5.4",
+            "instructions": "You are helpful.",
+            "input": [
+                {"role": "user", "content": "Hello"},
+                {
+                    "type": "tool_search_call",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "arguments": {"paths": ["unit"]},
+                },
+                {
+                    "type": "tool_search_output",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "unit",
+                            "description": "Unit MCP tools.",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "mcp_unit_lookup",
+                                    "description": "Lookup.",
+                                    "defer_loading": True,
+                                    "parameters": {"type": "object", "properties": {}},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {"type": "tool_search"},
+                {
+                    "type": "namespace",
+                    "name": "unit",
+                    "description": "Unit MCP tools.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "mcp_unit_lookup",
+                            "description": "Lookup.",
+                            "defer_loading": True,
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                },
+            ],
+            "store": False,
+        }
+        normalized = transport.preflight_kwargs(kw)
+        assert normalized["tools"][0] == {"type": "tool_search"}
+        assert normalized["tools"][1]["type"] == "namespace"
+        assert normalized["input"][1]["type"] == "tool_search_call"
+        assert normalized["input"][2]["tools"][0]["type"] == "namespace"
 
     def test_system_extracted_from_messages(self, transport):
         messages = [
@@ -452,6 +719,73 @@ class TestCodexNormalizeResponse:
         tc = nr.tool_calls[0]
         assert tc.name == "terminal"
         assert '"command"' in tc.arguments
+
+    def test_tool_search_items_and_namespace_are_preserved(self, transport):
+        """Hosted tool-search replay items must survive across store=False turns."""
+        loaded_namespace = {
+            "type": "namespace",
+            "name": "unit",
+            "description": "Unit MCP tools.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "mcp_unit_lookup",
+                    "description": "Lookup a unit test value.",
+                    "defer_loading": True,
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+        r = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="tool_search_call",
+                    execution="server",
+                    call_id=None,
+                    status="completed",
+                    arguments={"paths": ["unit"]},
+                ),
+                SimpleNamespace(
+                    type="tool_search_output",
+                    execution="server",
+                    call_id=None,
+                    status="completed",
+                    tools=[loaded_namespace],
+                ),
+                SimpleNamespace(
+                    type="function_call",
+                    call_id="call_abc123",
+                    name="mcp_unit_lookup",
+                    namespace="unit",
+                    arguments="{}",
+                    id="fc_abc123",
+                    status="completed",
+                ),
+            ],
+            status="completed",
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=10, output_tokens=20,
+                                  input_tokens_details=None, output_tokens_details=None),
+        )
+        nr = transport.normalize_response(r)
+        assert nr.finish_reason == "tool_calls"
+        assert nr.codex_tool_search_items == [
+            {
+                "type": "tool_search_call",
+                "execution": "server",
+                "call_id": None,
+                "status": "completed",
+                "arguments": {"paths": ["unit"]},
+            },
+            {
+                "type": "tool_search_output",
+                "execution": "server",
+                "call_id": None,
+                "status": "completed",
+                "tools": [loaded_namespace],
+            },
+        ]
+        assert nr.tool_calls[0].namespace == "unit"
 
 
 
