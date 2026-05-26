@@ -127,6 +127,42 @@ class TestCodexTransportBasic:
         finally:
             registry.deregister("mcp_unit_server_lookup")
 
+    def test_hosted_tool_search_prefixes_builtin_namespaces(self, transport):
+        from tools.registry import registry
+
+        registry.register(
+            name="unit_web_search",
+            toolset="web",
+            schema={
+                "name": "unit_web_search",
+                "description": "Search the web.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda *_a, **_k: "{}",
+        )
+        try:
+            result = transport.build_kwargs(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "unit_web_search",
+                            "description": "Search the web.",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                is_codex_backend=True,
+                enable_hosted_tool_search=True,
+            )["tools"]
+            namespace = next(t for t in result if t["type"] == "namespace")
+            assert namespace["name"] == "hermes_web"
+            assert namespace["description"] == "Search the web and extract webpage content."
+        finally:
+            registry.deregister("unit_web_search")
+
     def test_hosted_tool_search_loads_config_once_per_request(self, transport, monkeypatch):
         import hermes_cli.config
         from tools.registry import registry
