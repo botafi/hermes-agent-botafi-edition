@@ -43,6 +43,7 @@ def _make_args(**kwargs):
         "auth": None,
         "preset": None,
         "env": None,
+        "description": None,
         "mcp_action": None,
     }
     defaults.update(kwargs)
@@ -211,6 +212,34 @@ class TestMcpAdd:
         assert "ink" in config.get("mcp_servers", {})
         assert config["mcp_servers"]["ink"]["url"] == "https://mcp.ml.ink/mcp"
 
+    def test_add_server_saves_description(self, tmp_path, capsys, monkeypatch):
+        """MCP server descriptions are saved for listings and namespaces."""
+        fake_tools = [FakeTool("search", "Search docs")]
+
+        def mock_probe(name, config, **kw):
+            assert config["description"] == "Search internal docs."
+            return [(t.name, t.description) for t in fake_tools]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        inputs = iter(["n", ""])  # no auth needed, enable all
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+        from hermes_cli.config import load_config
+
+        cmd_mcp_add(_make_args(
+            name="docs",
+            url="https://docs.example.com/mcp",
+            description="  Search\ninternal   docs.  ",
+        ))
+        out = capsys.readouterr().out
+        assert "Saved" in out
+
+        config = load_config()
+        assert config["mcp_servers"]["docs"]["description"] == "Search internal docs."
+
     def test_add_stdio_server(self, tmp_path, capsys, monkeypatch):
         """Add a stdio server."""
         fake_tools = [FakeTool("search", "Search repos")]
@@ -331,7 +360,7 @@ class TestMcpAdd:
         """A preset fills in command/args when no explicit transport given."""
         monkeypatch.setattr(
             "hermes_cli.mcp_config._MCP_PRESETS",
-            {"testmcp": {"command": "npx", "args": ["-y", "test-mcp-server"], "display_name": "Test MCP"}},
+            {"testmcp": {"command": "npx", "args": ["-y", "test-mcp-server"], "display_name": "Test MCP", "description": "Test MCP tools."}},
         )
         fake_tools = [FakeTool("do_thing", "Does a thing")]
 
@@ -358,6 +387,7 @@ class TestMcpAdd:
         srv = config["mcp_servers"]["myserver"]
         assert srv["command"] == "npx"
         assert srv["args"] == ["-y", "test-mcp-server"]
+        assert srv["description"] == "Test MCP tools."
         assert "env" not in srv
 
     def test_preset_does_not_override_explicit_command(self, tmp_path, capsys, monkeypatch):
@@ -649,4 +679,3 @@ class TestMcpLogin:
 
         assert "Authenticated — 3 tool(s) available" in out
         assert "no OAuth token" not in out
-

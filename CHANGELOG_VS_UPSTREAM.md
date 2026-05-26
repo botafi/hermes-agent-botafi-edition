@@ -1,4 +1,55 @@
-Adds a per-call terminal backend override so sessions can default to sandboxed Docker while explicitly allowing local control-plane commands when needed.
+Adds OpenAI hosted tool search support for Responses providers, with configurable tool namespaces and MCP server descriptions.
+
+
+## Hosted tool search and namespaces
+
+Adds support for OpenAI Responses API hosted `tool_search` on providers and models that support deferred tool loading. Hermes now keeps required tools present in the request and groups the rest into short namespaces with `defer_loading=true`.
+
+Always-present tools default to:
+
+- `send_message`
+- `terminal`
+- `process`
+- `execute_code`
+- `session_search`
+
+Other built-in tools are grouped by practical area, such as `filesystem`, `web`, `browser`, `media`, `skills`, `automation`, `messaging`, `smart_home`, and `core`.
+
+### MCP namespace support
+
+MCP servers now map to hosted-search namespaces using `mcp_<server_name>`. For example, a configured `github` MCP server becomes the `mcp_github` namespace.
+
+Each MCP server can now carry a short config description:
+
+```yaml
+mcp_servers:
+  github:
+    description: "GitHub repository, issue, and pull request tools."
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+```
+
+`hermes mcp add` accepts `--description`, and `hermes mcp list` / `hermes mcp test` display it. Hosted tool-search namespace descriptions inherit `mcp_servers.<name>.description` unless overridden in `tools.hosted_search.namespaces`.
+
+### Provider and model gating
+
+Hosted tool search is configurable under `tools.hosted_search`:
+
+- `enabled: auto | true | false`
+- per-provider `enabled`
+- per-provider `model_allow` and `model_deny`
+- per-namespace descriptions
+- per-tool `namespace` and `always_present` overrides
+
+The default policy is conservative. Real OpenAI Responses surfaces (`openai-api` on `api.openai.com` and `openai-codex` on ChatGPT Codex OAuth) are enabled only for allowed model patterns. OpenAI-compatible proxies remain off unless explicitly opted in per provider/model.
+
+If a provider rejects `tool_search`, `namespace`, or `defer_loading` with an explicit 4xx schema error, Hermes disables hosted tool search for the current session and retries with flat tool schemas. Non-HTTP errors and transient failures do not disable the feature.
+
+### Replay and performance hardening
+
+Responses history now preserves `tool_search_call`, `tool_search_output`, and function-call `namespace` records so deferred namespace tool calls can be replayed correctly with `store=false`.
+
+Hosted-search config is loaded once per Responses request and passed into registry metadata lookup, avoiding repeated config file reads for every tool schema.
 
 
 ## Docker-default tool ergonomics

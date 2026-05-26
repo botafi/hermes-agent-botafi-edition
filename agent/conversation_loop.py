@@ -2284,14 +2284,46 @@ def run_conversation(
                 _looks_like_image_rejection = any(
                     p in _err_lower for p in _IMAGE_REJECTION_PHRASES
                 )
-                # 4xx-only gate: never interpret 5xx/timeout as "server
-                # said no to images" — those are transient and must
-                # route to the normal retry path.
-                _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
+                # 4xx-only gate: never interpret 5xx/timeout/non-HTTP
+                # exceptions as provider schema rejections — those are
+                # transient and must route to the normal retry path.
+                try:
+                    _status_is_4xx = _err_status is not None and 400 <= int(_err_status) < 500
+                except (TypeError, ValueError):
+                    _status_is_4xx = False
+                _TOOL_SEARCH_REJECTION_PHRASES = (
+                    "unsupported tool type",
+                    "unsupported type 'tool_search'",
+                    "unsupported type tool_search",
+                    "unsupported type 'namespace'",
+                    "unsupported type namespace",
+                    "unknown tool type",
+                    "unknown variant `tool_search`",
+                    "unknown variant tool_search",
+                    "unknown variant `namespace`",
+                    "unknown variant namespace",
+                    "defer_loading",
+                    "tool_search is not supported",
+                    "tool search is not supported",
+                )
+                if (
+                    agent.api_mode == "codex_responses"
+                    and not getattr(agent, "_codex_hosted_tool_search_disabled", False)
+                    and _status_is_4xx
+                    and any(p in _err_lower for p in _TOOL_SEARCH_REJECTION_PHRASES)
+                ):
+                    agent._codex_hosted_tool_search_disabled = True
+                    agent._vprint(
+                        f"{agent.log_prefix}🔎 Provider rejected hosted tool search — "
+                        "falling back to flat tool schemas for this session.",
+                        force=True,
+                    )
+                    continue
+
                 if (
                     getattr(agent, "_vision_supported", True)
                     and _looks_like_image_rejection
-                    and _status_ok
+                    and _status_is_4xx
                 ):
                     agent._vision_supported = False
                     _imgs_removed = _strip_images_from_messages(messages)

@@ -62,6 +62,11 @@ class ToolCall:
         return (self.provider_data or {}).get("response_item_id")
 
     @property
+    def namespace(self) -> str | None:
+        """Responses namespace for deferred/hosted tool-search function calls."""
+        return (self.provider_data or {}).get("namespace")
+
+    @property
     def extra_content(self) -> dict[str, Any] | None:
         """Gemini extra_content (thought_signature) from provider_data.
 
@@ -130,6 +135,11 @@ class NormalizedResponse:
     def codex_message_items(self):
         pd = self.provider_data or {}
         return pd.get("codex_message_items")
+
+    @property
+    def codex_tool_search_items(self):
+        pd = self.provider_data or {}
+        return pd.get("codex_tool_search_items")
 
 
 # ---------------------------------------------------------------------------

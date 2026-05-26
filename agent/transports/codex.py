@@ -127,7 +127,10 @@ class ResponsesApiTransport(ProviderTransport):
         _effort_clamp = {"minimal": "low"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
-        response_tools = _responses_tools(tools)
+        response_tools = _responses_tools(
+            tools,
+            hosted_tool_search=bool(params.get("enable_hosted_tool_search")),
+        )
         # ``tools`` MUST be omitted entirely when there are no functions to
         # expose: the openai SDK's ``responses.stream()`` / ``responses.parse()``
         # eagerly call ``_make_tools(tools)`` which does ``for tool in tools``
@@ -289,6 +292,8 @@ class ResponsesApiTransport(ProviderTransport):
                     provider_data["call_id"] = tc.call_id
                 if hasattr(tc, "response_item_id") and tc.response_item_id:
                     provider_data["response_item_id"] = tc.response_item_id
+                if hasattr(tc, "namespace") and tc.namespace:
+                    provider_data["namespace"] = tc.namespace
                 tool_calls.append(ToolCall(
                     id=tc.id if hasattr(tc, "id") else (tc.function.name if hasattr(tc, "function") else None),
                     name=tc.function.name if hasattr(tc, "function") else getattr(tc, "name", ""),
@@ -302,6 +307,8 @@ class ResponsesApiTransport(ProviderTransport):
             provider_data["codex_reasoning_items"] = msg.codex_reasoning_items
         if msg and hasattr(msg, "codex_message_items") and msg.codex_message_items:
             provider_data["codex_message_items"] = msg.codex_message_items
+        if msg and hasattr(msg, "codex_tool_search_items") and msg.codex_tool_search_items:
+            provider_data["codex_tool_search_items"] = msg.codex_tool_search_items
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
 
