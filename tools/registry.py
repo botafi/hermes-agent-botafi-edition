@@ -108,15 +108,30 @@ def _hosted_search_safe_identifier(value: str, *, fallback: str = "tools") -> st
     return safe or fallback
 
 
+def _hosted_search_wire_namespace(value: str, *, fallback: str = "tools") -> str:
+    """Return a user-defined Responses namespace that avoids hosted-tool collisions."""
+    safe = _hosted_search_safe_identifier(value, fallback=fallback)
+    if safe.startswith(("hermes_", "mcp_")):
+        return safe
+    return "hermes_" + safe
+
+
+def _hosted_search_logical_namespace(namespace: str) -> str:
+    """Return the config/default-description key for a wire namespace."""
+    if isinstance(namespace, str) and namespace.startswith("hermes_"):
+        return namespace[len("hermes_"):] or namespace
+    return namespace
+
+
 def _default_hosted_search_namespace(name: str, toolset: str) -> str:
     if name in _HOSTED_SEARCH_NAMESPACE_BY_TOOL:
-        return _HOSTED_SEARCH_NAMESPACE_BY_TOOL[name]
+        return _hosted_search_wire_namespace(_HOSTED_SEARCH_NAMESPACE_BY_TOOL[name])
     if isinstance(toolset, str) and toolset.startswith("mcp-"):
         return "mcp_" + _hosted_search_safe_identifier(toolset[len("mcp-"):], fallback="server")
     mapped = _HOSTED_SEARCH_NAMESPACE_BY_TOOLSET.get(toolset)
     if mapped:
-        return mapped
-    return _hosted_search_safe_identifier(toolset or "tools")
+        return _hosted_search_wire_namespace(mapped)
+    return _hosted_search_wire_namespace(toolset or "tools")
 
 
 def _mcp_server_description_for_namespace(cfg: dict, namespace: str) -> str:
@@ -214,7 +229,7 @@ class ToolEntry:
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
         self.hosted_search_namespace = (
-            _hosted_search_safe_identifier(hosted_search_namespace)
+            _hosted_search_wire_namespace(hosted_search_namespace)
             if hosted_search_namespace else _default_hosted_search_namespace(name, toolset)
         )
         self.hosted_search_always_present = (
@@ -597,7 +612,11 @@ class ToolRegistry:
 
         namespace = entry.hosted_search_namespace
         always_present = bool(entry.hosted_search_always_present)
-        description = _HOSTED_SEARCH_NAMESPACE_DESCRIPTIONS.get(namespace, "")
+        logical_namespace = _hosted_search_logical_namespace(namespace)
+        description = (
+            _HOSTED_SEARCH_NAMESPACE_DESCRIPTIONS.get(namespace)
+            or _HOSTED_SEARCH_NAMESPACE_DESCRIPTIONS.get(logical_namespace, "")
+        )
 
         cfg = {}
         full_cfg = {}
@@ -622,7 +641,8 @@ class ToolRegistry:
         if isinstance(override, dict):
             raw_namespace = override.get("namespace")
             if isinstance(raw_namespace, str) and raw_namespace.strip():
-                namespace = _hosted_search_safe_identifier(raw_namespace)
+                namespace = _hosted_search_wire_namespace(raw_namespace)
+                logical_namespace = _hosted_search_logical_namespace(namespace)
             if "always_present" in override:
                 always_present = bool(override.get("always_present"))
 
@@ -631,7 +651,9 @@ class ToolRegistry:
             description = mcp_description
 
         namespaces_cfg = cfg.get("namespaces")
-        ns_cfg = namespaces_cfg.get(namespace) if isinstance(namespaces_cfg, dict) else None
+        ns_cfg = None
+        if isinstance(namespaces_cfg, dict):
+            ns_cfg = namespaces_cfg.get(namespace) or namespaces_cfg.get(logical_namespace)
         if isinstance(ns_cfg, dict):
             raw_desc = ns_cfg.get("description")
             if isinstance(raw_desc, str) and raw_desc.strip():
@@ -642,7 +664,7 @@ class ToolRegistry:
                 display = namespace[len("mcp_"):].replace("_", " ")
                 description = f"Tools from the {display} MCP server."
             else:
-                description = f"{namespace.replace('_', ' ').title()} tools."
+                description = f"{logical_namespace.replace('_', ' ').title()} tools."
 
         return {
             "namespace": namespace,

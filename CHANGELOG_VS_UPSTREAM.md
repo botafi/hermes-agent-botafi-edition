@@ -13,7 +13,7 @@ Always-present tools default to:
 - `execute_code`
 - `session_search`
 
-Other built-in tools are grouped by practical area, such as `filesystem`, `web`, `browser`, `media`, `skills`, `automation`, `messaging`, `smart_home`, and `core`.
+Other built-in tools are grouped by practical area using `hermes_*` namespace names, such as `hermes_filesystem`, `hermes_web`, `hermes_browser`, `hermes_media`, `hermes_skills`, `hermes_automation`, `hermes_messaging`, `hermes_smart_home`, and `hermes_core`. The prefix avoids collisions with OpenAI hosted-tool namespaces such as `web`.
 
 ### MCP namespace support
 
