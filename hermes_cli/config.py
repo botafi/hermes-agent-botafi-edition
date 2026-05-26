@@ -903,6 +903,52 @@ DEFAULT_CONFIG = {
         "max_line_length": 2000,
     },
 
+    # Tool metadata and hosted tool-search controls.
+    # Hosted search is a Responses API feature for models that support
+    # ``tool_search``. Hermes keeps always-present tools in the prompt and
+    # groups the rest into short namespaces with defer_loading=true.
+    "tools": {
+        "hosted_search": {
+            # "auto" enables only for known OpenAI Responses providers/models.
+            # true forces on for matching model_allow/model_deny rules; false disables.
+            "enabled": "auto",
+            "default_always_present": [
+                "send_message",
+                "terminal",
+                "process",
+                "execute_code",
+                "session_search",
+            ],
+            "providers": {
+                "openai-api": {
+                    "enabled": "auto",
+                    "model_allow": ["gpt-5.4*", "gpt-5.5*", "gpt-6*"],
+                    "model_deny": ["gpt-5.4-nano*"],
+                },
+                "openai-codex": {
+                    "enabled": "auto",
+                    "model_allow": ["gpt-5.4*", "gpt-5.5*", "gpt-6*"],
+                    "model_deny": ["gpt-5.4-nano*"],
+                },
+            },
+            "namespaces": {
+                "automation": {"description": "Scheduled jobs, delegation, and multi-agent coordination."},
+                "browser": {"description": "Browser navigation, page inspection, and interaction."},
+                "core": {"description": "Conversation control, task state, memory, and session search."},
+                "filesystem": {"description": "Read, search, write, and patch workspace files."},
+                "media": {"description": "Vision, image, video, and audio generation tools."},
+                "messaging": {"description": "Send messages through connected chat platforms."},
+                "skills": {"description": "Discover, inspect, and manage Hermes skills."},
+                "smart_home": {"description": "Inspect and control Home Assistant entities."},
+                "terminal": {"description": "Run shell commands, processes, and code sandboxes."},
+                "web": {"description": "Search the web and extract webpage content."},
+            },
+            # Per-tool overrides, keyed by exact tool name. Values here beat
+            # registry defaults and default_always_present.
+            "tool_overrides": {},
+        },
+    },
+
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
     # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
