@@ -248,6 +248,14 @@ def _responses_tools(
 
     converted: List[Dict[str, Any]] = []
     namespaces: Dict[str, Dict[str, Any]] = {}
+    hosted_search_config = None
+    if hosted_tool_search:
+        try:
+            from hermes_cli.config import load_config
+
+            hosted_search_config = load_config() or {}
+        except Exception:
+            hosted_search_config = {}
     for item in tools:
         converted_tool = _responses_function_tool_from_chat_tool(item)
         if converted_tool is None:
@@ -258,7 +266,10 @@ def _responses_tools(
             try:
                 from tools.registry import registry
 
-                metadata = registry.get_hosted_search_metadata(converted_tool["name"])
+                metadata = registry.get_hosted_search_metadata(
+                    converted_tool["name"],
+                    config=hosted_search_config,
+                )
             except Exception:
                 metadata = {}
             if not bool(metadata.get("always_present")):

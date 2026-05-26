@@ -577,7 +577,7 @@ class ToolRegistry:
         entry = self.get_entry(name)
         return entry.toolset if entry else None
 
-    def get_hosted_search_metadata(self, name: str) -> dict:
+    def get_hosted_search_metadata(self, name: str, config: dict | None = None) -> dict:
         """Return hosted tool-search metadata for a registered tool.
 
         Values start with registry defaults and are then overlaid from
@@ -601,13 +601,17 @@ class ToolRegistry:
 
         cfg = {}
         full_cfg = {}
-        try:
-            from hermes_cli.config import load_config
-
-            full_cfg = load_config() or {}
+        if isinstance(config, dict):
+            full_cfg = config
             cfg = ((full_cfg.get("tools") or {}).get("hosted_search") or {})
-        except Exception:
-            cfg = {}
+        else:
+            try:
+                from hermes_cli.config import load_config
+
+                full_cfg = load_config() or {}
+                cfg = ((full_cfg.get("tools") or {}).get("hosted_search") or {})
+            except Exception:
+                cfg = {}
 
         default_always_present = cfg.get("default_always_present")
         if isinstance(default_always_present, (list, tuple, set)):

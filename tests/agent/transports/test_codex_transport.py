@@ -127,6 +127,50 @@ class TestCodexTransportBasic:
         finally:
             registry.deregister("mcp_unit_server_lookup")
 
+    def test_hosted_tool_search_loads_config_once_per_request(self, transport, monkeypatch):
+        import hermes_cli.config
+        from tools.registry import registry
+
+        calls = {"count": 0}
+
+        def fake_load_config():
+            calls["count"] += 1
+            return {"tools": {"hosted_search": {}}}
+
+        monkeypatch.setattr(hermes_cli.config, "load_config", fake_load_config)
+
+        schemas = [
+            {
+                "name": "mcp_config_once_lookup",
+                "description": "Lookup.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "mcp_config_once_update",
+                "description": "Update.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+        for schema in schemas:
+            registry.register(
+                name=schema["name"],
+                toolset="mcp-config-once",
+                schema=schema,
+                handler=lambda *_a, **_k: "{}",
+            )
+        try:
+            transport.build_kwargs(
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=[{"type": "function", "function": schema} for schema in schemas],
+                is_codex_backend=True,
+                enable_hosted_tool_search=True,
+            )
+            assert calls["count"] == 1
+        finally:
+            registry.deregister("mcp_config_once_lookup")
+            registry.deregister("mcp_config_once_update")
+
     def test_chat_message_conversion_replays_tool_search_before_function_call(self):
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
 
