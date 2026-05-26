@@ -17,6 +17,8 @@ For conceptual guidance, see:
 ```yaml
 mcp_servers:
   <server_name>:
+    description: "Short description for listings and tool namespaces"
+
     command: "..."      # stdio servers
     args: []
     env: {}
@@ -40,6 +42,7 @@ mcp_servers:
 
 | Key | Type | Applies to | Meaning |
 |---|---|---|---|
+| `description` | string | both | Short human-readable server description. Also used as the hosted tool-search namespace description for `mcp_<server_name>` unless overridden under `tools.hosted_search.namespaces`. |
 | `command` | string | stdio | Executable to launch |
 | `args` | list | stdio | Arguments for the subprocess |
 | `env` | mapping | stdio | Environment passed to the subprocess |
