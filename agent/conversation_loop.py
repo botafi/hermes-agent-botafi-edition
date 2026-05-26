@@ -2305,6 +2305,8 @@ def run_conversation(
                     "defer_loading",
                     "tool_search is not supported",
                     "tool search is not supported",
+                    "collides with an existing tool namespace",
+                    "tools.namespace",
                 )
                 if (
                     agent.api_mode == "codex_responses"
