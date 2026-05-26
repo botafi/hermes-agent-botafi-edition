@@ -14,18 +14,21 @@ Example config::
 
     mcp_servers:
       filesystem:
+        description: "Filesystem tools for selected local paths."
         command: "npx"
         args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
         env: {}
         timeout: 120         # per-tool-call timeout in seconds (default: 120)
         connect_timeout: 60  # initial connection timeout (default: 60)
       github:
+        description: "GitHub repository, issue, and pull request tools."
         command: "npx"
         args: ["-y", "@modelcontextprotocol/server-github"]
         env:
           GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
         supports_parallel_tool_calls: true  # tools from this server may run concurrently
       remote_api:
+        description: "Remote API tools exposed over MCP."
         url: "https://my-mcp-server.example.com/mcp"
         headers:
           Authorization: "Bearer sk-..."
