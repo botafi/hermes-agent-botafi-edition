@@ -906,7 +906,7 @@ DEFAULT_CONFIG = {
     # Tool metadata and hosted tool-search controls.
     # Hosted search is a Responses API feature for models that support
     # ``tool_search``. Hermes keeps always-present tools in the prompt and
-    # groups the rest into short namespaces with defer_loading=true.
+    # groups the rest into short hermes_* namespaces with defer_loading=true.
     "tools": {
         "hosted_search": {
             # "auto" enables only for known OpenAI Responses providers/models.
@@ -932,16 +932,16 @@ DEFAULT_CONFIG = {
                 },
             },
             "namespaces": {
-                "automation": {"description": "Scheduled jobs, delegation, and multi-agent coordination."},
-                "browser": {"description": "Browser navigation, page inspection, and interaction."},
-                "core": {"description": "Conversation control, task state, memory, and session search."},
-                "filesystem": {"description": "Read, search, write, and patch workspace files."},
-                "media": {"description": "Vision, image, video, and audio generation tools."},
-                "messaging": {"description": "Send messages through connected chat platforms."},
-                "skills": {"description": "Discover, inspect, and manage Hermes skills."},
-                "smart_home": {"description": "Inspect and control Home Assistant entities."},
-                "terminal": {"description": "Run shell commands, processes, and code sandboxes."},
-                "web": {"description": "Search the web and extract webpage content."},
+                "hermes_automation": {"description": "Scheduled jobs, delegation, and multi-agent coordination."},
+                "hermes_browser": {"description": "Browser navigation, page inspection, and interaction."},
+                "hermes_core": {"description": "Conversation control, task state, memory, and session search."},
+                "hermes_filesystem": {"description": "Read, search, write, and patch workspace files."},
+                "hermes_media": {"description": "Vision, image, video, and audio generation tools."},
+                "hermes_messaging": {"description": "Send messages through connected chat platforms."},
+                "hermes_skills": {"description": "Discover, inspect, and manage Hermes skills."},
+                "hermes_smart_home": {"description": "Inspect and control Home Assistant entities."},
+                "hermes_terminal": {"description": "Run shell commands, processes, and code sandboxes."},
+                "hermes_web": {"description": "Search the web and extract webpage content."},
             },
             # Per-tool overrides, keyed by exact tool name. Values here beat
             # registry defaults and default_always_present.
