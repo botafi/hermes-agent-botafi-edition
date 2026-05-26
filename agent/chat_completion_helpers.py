@@ -606,6 +606,16 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         )
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
+        try:
+            from agent.hosted_tool_search import provider_supports_hosted_tool_search
+
+            _enable_hosted_tool_search = provider_supports_hosted_tool_search(
+                provider=agent.provider,
+                model=agent.model,
+                base_url=agent.base_url,
+            )
+        except Exception:
+            _enable_hosted_tool_search = False
 
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
@@ -640,6 +650,10 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
+            enable_hosted_tool_search=(
+                _enable_hosted_tool_search
+                and not bool(getattr(agent, "_codex_hosted_tool_search_disabled", False))
+            ),
             github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
@@ -952,6 +966,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
 
+    codex_tool_search_items = getattr(assistant_message, "codex_tool_search_items", None)
+    if codex_tool_search_items:
+        msg["codex_tool_search_items"] = codex_tool_search_items
+
     if assistant_tool_calls:
         tool_calls = []
         for tool_call in assistant_tool_calls:
@@ -990,6 +1008,9 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                     "arguments": tool_call.function.arguments
                 },
             }
+            namespace = getattr(tool_call, "namespace", None)
+            if isinstance(namespace, str) and namespace.strip():
+                tc_dict["namespace"] = namespace.strip()
             # Defence-in-depth: redact credentials from tool call arguments
             # before they enter conversation history. Tool execution uses the
             # raw API response object, not this dict, so redacting the

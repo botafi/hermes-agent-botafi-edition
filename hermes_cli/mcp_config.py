@@ -36,6 +36,7 @@ _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
     "codex": {
         "command": "codex",
         "args": ["mcp-server"],
+        "description": "Codex CLI project and code-editing tools.",
     },
 }
 
@@ -126,6 +127,13 @@ def _parse_env_assignments(raw_env: Optional[List[str]]) -> Dict[str, str]:
             raise ValueError(f"Invalid --env variable name '{key}'")
         parsed[key] = value
     return parsed
+
+
+def _normalize_server_description(value: Optional[str]) -> str:
+    """Return a concise single-line MCP server description."""
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value).strip()[:240]
 
 
 def _apply_mcp_preset(
@@ -235,11 +243,12 @@ def cmd_mcp_add(args):
     auth_type = getattr(args, "auth", None)
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
+    description = _normalize_server_description(getattr(args, "description", None))
 
     server_config: Dict[str, Any] = {}
     try:
         explicit_env = _parse_env_assignments(raw_env)
-        url, command, cmd_args, _preset_applied = _apply_mcp_preset(
+        url, command, cmd_args, preset_applied = _apply_mcp_preset(
             name,
             preset_name=preset_name,
             url=url,
@@ -250,6 +259,11 @@ def cmd_mcp_add(args):
     except ValueError as exc:
         _error(str(exc))
         return
+
+    if not description and preset_applied and preset_name in _MCP_PRESETS:
+        description = _normalize_server_description(_MCP_PRESETS[preset_name].get("description"))
+    if description:
+        server_config["description"] = description
 
     if url and explicit_env:
         _error("--env is only supported for stdio MCP servers (--command or stdio presets)")
@@ -470,8 +484,8 @@ def cmd_mcp_list(args=None):
     print()
 
     # Table header
-    print(f"  {'Name':<16} {'Transport':<30} {'Tools':<12} {'Status':<10}")
-    print(f"  {'─' * 16} {'─' * 30} {'─' * 12} {'─' * 10}")
+    print(f"  {'Name':<16} {'Transport':<30} {'Tools':<12} {'Status':<10} Description")
+    print(f"  {'─' * 16} {'─' * 30} {'─' * 12} {'─' * 10} {'─' * 24}")
 
     for name, cfg in servers.items():
         # Transport info
@@ -513,7 +527,11 @@ def cmd_mcp_list(args=None):
             enabled = enabled.lower() in {"true", "1", "yes"}
         status = color("✓ enabled", Colors.GREEN) if enabled else color("✗ disabled", Colors.DIM)
 
-        print(f"  {name:<16} {transport:<30} {tools_str:<12} {status}")
+        description = str(cfg.get("description") or "").strip()
+        if len(description) > 36:
+            description = description[:33] + "..."
+
+        print(f"  {name:<16} {transport:<30} {tools_str:<12} {status}  {description}")
 
     print()
 
@@ -542,6 +560,9 @@ def cmd_mcp_test(args):
     else:
         cmd = cfg.get("command", "?")
         _info(f"Transport: stdio → {cmd}")
+    description = str(cfg.get("description") or "").strip()
+    if description:
+        _info(f"Description: {description}")
 
     # Show auth info (masked)
     auth_type = cfg.get("auth", "")
