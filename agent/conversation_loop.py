@@ -2138,6 +2138,35 @@ def run_conversation(
                 # said no to images" — those are transient and must
                 # route to the normal retry path.
                 _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
+                _TOOL_SEARCH_REJECTION_PHRASES = (
+                    "unsupported tool type",
+                    "unsupported type 'tool_search'",
+                    "unsupported type tool_search",
+                    "unsupported type 'namespace'",
+                    "unsupported type namespace",
+                    "unknown tool type",
+                    "unknown variant `tool_search`",
+                    "unknown variant tool_search",
+                    "unknown variant `namespace`",
+                    "unknown variant namespace",
+                    "defer_loading",
+                    "tool_search is not supported",
+                    "tool search is not supported",
+                )
+                if (
+                    agent.api_mode == "codex_responses"
+                    and not getattr(agent, "_codex_hosted_tool_search_disabled", False)
+                    and _status_ok
+                    and any(p in _err_lower for p in _TOOL_SEARCH_REJECTION_PHRASES)
+                ):
+                    agent._codex_hosted_tool_search_disabled = True
+                    agent._vprint(
+                        f"{agent.log_prefix}🔎 Provider rejected hosted tool search — "
+                        "falling back to flat tool schemas for this session.",
+                        force=True,
+                    )
+                    continue
+
                 if (
                     getattr(agent, "_vision_supported", True)
                     and _looks_like_image_rejection

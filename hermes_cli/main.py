@@ -12993,6 +12993,10 @@ Examples:
     mcp_add_p.add_argument("--auth", choices=["oauth", "header"], help="Auth method")
     mcp_add_p.add_argument("--preset", help="Known MCP preset name")
     mcp_add_p.add_argument(
+        "--description",
+        help="Short description used for MCP tool namespaces and listings",
+    )
+    mcp_add_p.add_argument(
         "--env",
         nargs="*",
         default=[],

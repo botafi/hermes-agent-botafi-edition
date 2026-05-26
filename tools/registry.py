@@ -18,12 +18,127 @@ import ast
 import importlib
 import json
 import logging
+import re
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+_HOSTED_SEARCH_ALWAYS_PRESENT_TOOLS = {
+    "send_message",
+    "terminal",
+    "process",
+    "execute_code",
+    "session_search",
+}
+
+_HOSTED_SEARCH_NAMESPACE_BY_TOOLSET = {
+    "browser-cdp": "browser",
+    "computer_use": "browser",
+    "code_execution": "terminal",
+    "delegation": "automation",
+    "discord": "messaging",
+    "discord_admin": "messaging",
+    "feishu_doc": "messaging",
+    "feishu_drive": "messaging",
+    "file": "filesystem",
+    "hermes-yuanbao": "messaging",
+    "homeassistant": "smart_home",
+    "image_gen": "media",
+    "kanban": "automation",
+    "messaging": "messaging",
+    "moa": "automation",
+    "session_search": "core",
+    "skills": "skills",
+    "terminal": "terminal",
+    "tts": "media",
+    "video": "media",
+    "video_gen": "media",
+    "vision": "media",
+    "x_search": "web",
+}
+
+_HOSTED_SEARCH_NAMESPACE_BY_TOOL = {
+    "clarify": "core",
+    "todo": "core",
+    "memory": "core",
+    "session_search": "core",
+    "read_file": "filesystem",
+    "write_file": "filesystem",
+    "patch": "filesystem",
+    "search_files": "filesystem",
+    "terminal": "terminal",
+    "process": "terminal",
+    "execute_code": "terminal",
+    "web_search": "web",
+    "web_extract": "web",
+    "x_search": "web",
+    "vision_analyze": "media",
+    "image_generate": "media",
+    "video_analyze": "media",
+    "video_generate": "media",
+    "text_to_speech": "media",
+    "skills_list": "skills",
+    "skill_view": "skills",
+    "skill_manage": "skills",
+    "delegate_task": "automation",
+    "cronjob": "automation",
+    "send_message": "messaging",
+}
+
+_HOSTED_SEARCH_NAMESPACE_DESCRIPTIONS = {
+    "automation": "Scheduled jobs, delegation, and multi-agent coordination.",
+    "browser": "Browser navigation, page inspection, and interaction.",
+    "core": "Conversation control, task state, memory, and session search.",
+    "filesystem": "Read, search, write, and patch workspace files.",
+    "media": "Vision, image, video, and audio generation tools.",
+    "messaging": "Send messages through connected chat platforms.",
+    "skills": "Discover, inspect, and manage Hermes skills.",
+    "smart_home": "Inspect and control Home Assistant entities.",
+    "terminal": "Run shell commands, processes, and code sandboxes.",
+    "web": "Search the web and extract webpage content.",
+}
+
+
+def _hosted_search_safe_identifier(value: str, *, fallback: str = "tools") -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", str(value or "")).strip("_")
+    return safe or fallback
+
+
+def _default_hosted_search_namespace(name: str, toolset: str) -> str:
+    if name in _HOSTED_SEARCH_NAMESPACE_BY_TOOL:
+        return _HOSTED_SEARCH_NAMESPACE_BY_TOOL[name]
+    if isinstance(toolset, str) and toolset.startswith("mcp-"):
+        return "mcp_" + _hosted_search_safe_identifier(toolset[len("mcp-"):], fallback="server")
+    mapped = _HOSTED_SEARCH_NAMESPACE_BY_TOOLSET.get(toolset)
+    if mapped:
+        return mapped
+    return _hosted_search_safe_identifier(toolset or "tools")
+
+
+def _mcp_server_description_for_namespace(cfg: dict, namespace: str) -> str:
+    """Return mcp_servers.<server>.description for an ``mcp_<server>`` namespace."""
+    if (
+        not isinstance(cfg, dict)
+        or not isinstance(namespace, str)
+        or not namespace.startswith("mcp_")
+    ):
+        return ""
+    servers = cfg.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return ""
+    namespace_server = namespace[len("mcp_"):]
+    for server_name, server_cfg in servers.items():
+        safe_name = _hosted_search_safe_identifier(server_name, fallback="server")
+        if safe_name != namespace_server or not isinstance(server_cfg, dict):
+            continue
+        description = server_cfg.get("description")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
+    return ""
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -81,11 +196,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "hosted_search_namespace", "hosted_search_always_present",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 hosted_search_namespace=None, hosted_search_always_present=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -96,6 +213,15 @@ class ToolEntry:
         self.description = description
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
+        self.hosted_search_namespace = (
+            _hosted_search_safe_identifier(hosted_search_namespace)
+            if hosted_search_namespace else _default_hosted_search_namespace(name, toolset)
+        )
+        self.hosted_search_always_present = (
+            bool(hosted_search_always_present)
+            if hosted_search_always_present is not None
+            else name in _HOSTED_SEARCH_ALWAYS_PRESENT_TOOLS
+        )
         # Optional zero-arg callable returning a dict of schema overrides
         # applied at get_definitions() time. Use for fields that depend on
         # runtime config (e.g. delegate_task's description must reflect the
@@ -244,6 +370,8 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        hosted_search_namespace: str | None = None,
+        hosted_search_always_present: bool | None = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -299,6 +427,8 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                hosted_search_namespace=hosted_search_namespace,
+                hosted_search_always_present=hosted_search_always_present,
             )
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
@@ -446,6 +576,75 @@ class ToolRegistry:
         """Return the toolset a tool belongs to, or None."""
         entry = self.get_entry(name)
         return entry.toolset if entry else None
+
+    def get_hosted_search_metadata(self, name: str) -> dict:
+        """Return hosted tool-search metadata for a registered tool.
+
+        Values start with registry defaults and are then overlaid from
+        ``tools.hosted_search`` in config.yaml:
+
+        tools:
+          hosted_search:
+            default_always_present: [terminal, process]
+            tool_overrides:
+              read_file:
+                namespace: filesystem
+                always_present: false
+        """
+        entry = self.get_entry(name)
+        if not entry:
+            return {}
+
+        namespace = entry.hosted_search_namespace
+        always_present = bool(entry.hosted_search_always_present)
+        description = _HOSTED_SEARCH_NAMESPACE_DESCRIPTIONS.get(namespace, "")
+
+        cfg = {}
+        full_cfg = {}
+        try:
+            from hermes_cli.config import load_config
+
+            full_cfg = load_config() or {}
+            cfg = ((full_cfg.get("tools") or {}).get("hosted_search") or {})
+        except Exception:
+            cfg = {}
+
+        default_always_present = cfg.get("default_always_present")
+        if isinstance(default_always_present, (list, tuple, set)):
+            always_present = name in {str(item) for item in default_always_present}
+
+        tool_overrides = cfg.get("tool_overrides")
+        override = tool_overrides.get(name) if isinstance(tool_overrides, dict) else None
+        if isinstance(override, dict):
+            raw_namespace = override.get("namespace")
+            if isinstance(raw_namespace, str) and raw_namespace.strip():
+                namespace = _hosted_search_safe_identifier(raw_namespace)
+            if "always_present" in override:
+                always_present = bool(override.get("always_present"))
+
+        mcp_description = _mcp_server_description_for_namespace(full_cfg, namespace)
+        if mcp_description:
+            description = mcp_description
+
+        namespaces_cfg = cfg.get("namespaces")
+        ns_cfg = namespaces_cfg.get(namespace) if isinstance(namespaces_cfg, dict) else None
+        if isinstance(ns_cfg, dict):
+            raw_desc = ns_cfg.get("description")
+            if isinstance(raw_desc, str) and raw_desc.strip():
+                description = raw_desc.strip()
+
+        if not description:
+            if namespace.startswith("mcp_"):
+                display = namespace[len("mcp_"):].replace("_", " ")
+                description = f"Tools from the {display} MCP server."
+            else:
+                description = f"{namespace.replace('_', ' ').title()} tools."
+
+        return {
+            "namespace": namespace,
+            "always_present": always_present,
+            "namespace_description": description,
+        }
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:
         """Return the emoji for a tool, or *default* if unset."""
