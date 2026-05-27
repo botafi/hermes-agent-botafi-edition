@@ -661,6 +661,19 @@ def _handle_create(args: dict, **kw) -> str:
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
+    project_value = args.get("project")
+    if project_value:
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli import kanban_projects
+            project = kanban_projects.resolve_project(
+                load_config() or {},
+                str(project_value),
+            )
+        except ValueError as e:
+            return tool_error(f"kanban_create: {e}")
+        workspace_kind = "dir"
+        workspace_path = project["path"]
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
@@ -1117,6 +1130,13 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "project": {
+                "type": "string",
+                "description": (
+                    "Configured project name or path discovered from "
+                    "kanban.projects_directories. Implies workspace_kind='dir'."
                 ),
             },
             "triage": {
