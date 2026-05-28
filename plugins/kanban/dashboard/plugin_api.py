@@ -577,6 +577,7 @@ class CreateTaskBody(BaseModel):
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
+    inherit_child_workspace: bool = False
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -608,6 +609,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             created_by="dashboard",
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
+            inherit_child_workspace=payload.inherit_child_workspace,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
@@ -808,6 +810,9 @@ class UpdateTaskBody(BaseModel):
     priority: Optional[int] = None
     title: Optional[str] = None
     body: Optional[str] = None
+    workspace_kind: Optional[str] = None
+    workspace_path: Optional[str] = None
+    inherit_child_workspace: Optional[bool] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
@@ -825,6 +830,39 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        field_set = getattr(payload, "model_fields_set", None)
+        if field_set is None:
+            field_set = getattr(payload, "__fields_set__", set())
+        workspace_patch = (
+            "workspace_kind" in field_set
+            or "workspace_path" in field_set
+            or "inherit_child_workspace" in field_set
+        )
+        if workspace_patch:
+            try:
+                ok = kanban_db.update_task_workspace(
+                    conn,
+                    task_id,
+                    workspace_kind=(
+                        payload.workspace_kind
+                        if "workspace_kind" in field_set else None
+                    ),
+                    workspace_path=(
+                        payload.workspace_path
+                        if "workspace_path" in field_set else kanban_db._MISSING
+                    ),
+                    inherit_child_workspace=(
+                        payload.inherit_child_workspace
+                        if "inherit_child_workspace" in field_set else None
+                    ),
+                )
+            except RuntimeError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -2225,6 +2263,7 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
 
 class DecomposeBody(BaseModel):
     author: Optional[str] = None
+    inherit_workspace: Optional[bool] = None
 
 
 @router.post("/tasks/{task_id}/decompose")
@@ -2252,6 +2291,7 @@ def decompose_task_endpoint(
         outcome = kanban_decompose.decompose_task(
             task_id,
             author=(payload.author or None),
+            inherit_workspace=payload.inherit_workspace,
         )
     finally:
         if prev_env is None:

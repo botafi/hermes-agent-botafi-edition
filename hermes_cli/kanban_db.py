@@ -725,6 +725,9 @@ class Task:
     # ``kanban.failure_limit`` config, and then to ``DEFAULT_FAILURE_LIMIT``.
     # Name matches the ``--max-retries`` CLI flag on ``kanban create``.
     max_retries: Optional[int] = None
+    # When true, decomposed child tasks inherit this task's workspace
+    # kind/path unless the manual decomposition call overrides it.
+    inherit_child_workspace: bool = False
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
     # tasks created from the CLI, the dashboard, or any path that doesn't
@@ -796,6 +799,9 @@ class Task:
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
+            ),
+            inherit_child_workspace=bool(
+                row["inherit_child_workspace"] if "inherit_child_workspace" in keys else 0
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
@@ -946,6 +952,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
     -- config and then ``DEFAULT_FAILURE_LIMIT``.
     max_retries          INTEGER,
+    -- When true, decomposed child tasks inherit this task's workspace
+    -- kind/path unless a manual decompose call explicitly overrides it.
+    inherit_child_workspace INTEGER NOT NULL DEFAULT 0,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -1581,6 +1590,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
+    if "inherit_child_workspace" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "inherit_child_workspace",
+            "inherit_child_workspace INTEGER NOT NULL DEFAULT 0",
+        )
+
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
@@ -1967,6 +1984,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    inherit_child_workspace: bool = False,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -2134,8 +2152,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, inherit_child_workspace, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2154,6 +2172,7 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        1 if inherit_child_workspace else 0,
                         session_id,
                     ),
                 )
@@ -4220,6 +4239,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    inherit_workspace: Optional[bool] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -4305,13 +4325,26 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant FROM tasks WHERE id = ?", (task_id,)
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "inherit_child_workspace FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        should_inherit_workspace = (
+            bool(root_row["inherit_child_workspace"])
+            if inherit_workspace is None
+            else bool(inherit_workspace)
+        )
+        child_workspace_kind = (
+            root_row["workspace_kind"] if should_inherit_workspace else "scratch"
+        )
+        child_workspace_path = (
+            root_row["workspace_path"] if should_inherit_workspace else None
+        )
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -4325,13 +4358,15 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', 'scratch', ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    child_workspace_kind,
+                    child_workspace_path,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -4400,6 +4435,7 @@ def decompose_triage_task(
             {
                 "child_ids": child_ids,
                 "root_assignee": root_assignee,
+                "inherit_workspace": should_inherit_workspace,
             },
         )
 
@@ -4564,6 +4600,85 @@ def set_workspace_path(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
         )
+
+
+_MISSING = object()
+
+
+def _normalize_workspace_update(
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> tuple[str, Optional[str]]:
+    kind = (workspace_kind or "scratch").strip()
+    if kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+            f"got {workspace_kind!r}"
+        )
+    path = str(workspace_path).strip() if workspace_path is not None else None
+    if path == "":
+        path = None
+    if kind == "dir" and not path:
+        raise ValueError("workspace_kind=dir requires an absolute workspace_path")
+    if path:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            raise ValueError(
+                f"workspace_path {workspace_path!r} must be absolute"
+            )
+        path = str(p)
+    return kind, path
+
+
+def update_task_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_kind: Optional[str] = None,
+    workspace_path: object = _MISSING,
+    inherit_child_workspace: Optional[bool] = None,
+) -> bool:
+    """Update a task's workspace fields, refusing live worker cwd changes."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    if task.status == "running":
+        raise RuntimeError("cannot edit workspace for a running task")
+
+    next_kind = workspace_kind if workspace_kind is not None else task.workspace_kind
+    if workspace_path is _MISSING:
+        next_path = task.workspace_path
+        if workspace_kind == "scratch" and task.workspace_kind != "scratch":
+            next_path = None
+    else:
+        next_path = workspace_path  # type: ignore[assignment]
+    norm_kind, norm_path = _normalize_workspace_update(
+        str(next_kind or "scratch"),
+        next_path if next_path is None else str(next_path),
+    )
+
+    sets = ["workspace_kind = ?", "workspace_path = ?"]
+    params: list[Any] = [norm_kind, norm_path]
+    if inherit_child_workspace is not None:
+        sets.append("inherit_child_workspace = ?")
+        params.append(1 if inherit_child_workspace else 0)
+    params.append(task_id)
+    with write_txn(conn):
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
+            tuple(params),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "workspace_updated",
+            {
+                "workspace_kind": norm_kind,
+                "workspace_path": norm_path,
+                "inherit_child_workspace": inherit_child_workspace,
+            },
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
