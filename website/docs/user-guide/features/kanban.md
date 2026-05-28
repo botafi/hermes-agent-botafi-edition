@@ -489,6 +489,16 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile that owns decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
+| `projects_directories` | `[]` | Parent directories whose direct child folders appear as selectable projects in the dashboard and via `hermes kanban create --project <name>`. |
+
+Example project picker config:
+
+```yaml
+kanban:
+  projects_directories:
+    - ~/projects
+    - /opt/data/projects
+```
 
 And the two auxiliary LLM slots:
 

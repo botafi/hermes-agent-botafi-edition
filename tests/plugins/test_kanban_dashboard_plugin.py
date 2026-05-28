@@ -114,6 +114,43 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_projects_endpoint_discovers_configured_project_dirs(client, kanban_home, tmp_path):
+    projects_root = tmp_path / "projects"
+    alpha = projects_root / "alpha"
+    beta = projects_root / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir()
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  projects_directories:\n    - " + projects_root.as_posix() + "\n",
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/projects")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["roots"][0]["path"] == projects_root.resolve().as_posix()
+    assert {p["name"] for p in data["projects"]} == {"alpha", "beta"}
+
+
+def test_create_task_project_sets_dir_workspace(client, kanban_home, tmp_path):
+    projects_root = tmp_path / "projects"
+    alpha = projects_root / "alpha"
+    alpha.mkdir(parents=True)
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  projects_directories:\n    - " + projects_root.as_posix() + "\n",
+        encoding="utf-8",
+    )
+
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Use project", "project": "alpha"},
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["workspace_kind"] == "dir"
+    assert task["workspace_path"] == alpha.resolve().as_posix()
+
+
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
     """Scheduled/time-delay tasks must not be silently bucketed into todo."""
 
