@@ -68,6 +68,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
+        "inherit_child_workspace": t.inherit_child_workspace,
         "branch_name": t.branch_name,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -317,6 +318,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "kanban.projects_directories. Implies --workspace dir:<path>.")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--inherit-child-workspace", action="store_true",
+                          help="When this task is decomposed, give child tasks the same workspace kind/path")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -813,6 +816,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Author name recorded on the audit comment "
              "(default: $HERMES_PROFILE or 'decomposer')",
+    )
+    inherit_group = p_decompose.add_mutually_exclusive_group()
+    inherit_group.add_argument(
+        "--inherit-workspace",
+        dest="inherit_workspace",
+        action="store_true",
+        default=None,
+        help="For this decomposition only, child tasks inherit the parent workspace",
+    )
+    inherit_group.add_argument(
+        "--no-inherit-workspace",
+        dest="inherit_workspace",
+        action="store_false",
+        help="For this decomposition only, child tasks use scratch workspaces",
     )
     p_decompose.add_argument(
         "--json",
@@ -1350,6 +1367,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
+            inherit_child_workspace=bool(getattr(args, "inherit_child_workspace", False)),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1518,6 +1536,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    print(f"  child workspace inheritance: {'yes' if task.inherit_child_workspace else 'no'}")
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
@@ -2589,7 +2608,11 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
     ok_count = 0
     for tid in ids:
-        outcome = decomp.decompose_task(tid, author=author)
+        outcome = decomp.decompose_task(
+            tid,
+            author=author,
+            inherit_workspace=getattr(args, "inherit_workspace", None),
+        )
         if outcome.ok:
             ok_count += 1
         if want_json:

@@ -143,6 +143,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "inherit_child_workspace" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
@@ -163,6 +164,19 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.status == "ready"
     assert t.assignee == "alice"
     assert t.workspace_kind == "scratch"
+    assert t.inherit_child_workspace is False
+
+
+def test_create_task_can_persist_child_workspace_inheritance(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship it",
+            inherit_child_workspace=True,
+        )
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.inherit_child_workspace is True
 
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
@@ -1161,6 +1175,31 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
     # c is now running
     with kb.connect() as conn:
         assert kb.get_task(conn, c).status == "running"
+
+
+def test_dispatch_uses_edited_dir_workspace_as_spawn_cwd(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    spawns = []
+    workdir = tmp_path / "project"
+
+    def fake_spawn(task, workspace):
+        spawns.append((task.id, workspace))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="edit cwd", assignee="alice")
+        ok = kb.update_task_workspace(
+            conn,
+            tid,
+            workspace_kind="dir",
+            workspace_path=str(workdir),
+        )
+        assert ok is True
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert res.spawned == [(tid, "alice", str(workdir))]
+    assert spawns == [(tid, str(workdir))]
+    assert workdir.is_dir()
 
 
 def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):

@@ -235,6 +235,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "inherit_child_workspace": task.inherit_child_workspace,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -280,6 +281,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "inherit_child_workspace": t.inherit_child_workspace,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -661,6 +663,11 @@ def _handle_create(args: dict, **kw) -> str:
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
+    inherit_child_workspace, inherit_bool_error = _parse_bool_arg(
+        args, "inherit_child_workspace",
+    )
+    if inherit_bool_error:
+        return tool_error(inherit_bool_error)
     project_value = args.get("project")
     if project_value:
         try:
@@ -708,6 +715,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                inherit_child_workspace=inherit_child_workspace,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1130,6 +1138,13 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "inherit_child_workspace": {
+                "type": "boolean",
+                "description": (
+                    "If true, decomposed children inherit this task's "
+                    "workspace kind/path by default."
                 ),
             },
             "project": {
