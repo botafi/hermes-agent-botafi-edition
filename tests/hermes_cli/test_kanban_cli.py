@@ -177,11 +177,38 @@ def test_run_slash_block_unblock_cycle(kanban_home):
 
 
 def test_run_slash_json_output(kanban_home):
-    out = kc.run_slash("create 'jsontask' --assignee alice --json")
+    out = kc.run_slash("create 'jsontask' --assignee alice --inherit-child-workspace --json")
     payload = json.loads(out)
     assert payload["title"] == "jsontask"
     assert payload["assignee"] == "alice"
     assert payload["status"] == "ready"
+    assert payload["inherit_child_workspace"] is True
+
+
+def test_run_slash_decompose_passes_workspace_override(kanban_home, monkeypatch):
+    from types import SimpleNamespace
+
+    seen = {}
+
+    def fake_decompose(task_id, *, author=None, inherit_workspace=None):
+        seen["task_id"] = task_id
+        seen["inherit_workspace"] = inherit_workspace
+        return SimpleNamespace(
+            task_id=task_id,
+            ok=True,
+            reason="done",
+            fanout=True,
+            child_ids=["t_child"],
+            new_title=None,
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_decompose.decompose_task",
+        fake_decompose,
+    )
+    out = kc.run_slash("decompose t_parent --inherit-workspace")
+    assert "Decomposed t_parent" in out
+    assert seen == {"task_id": "t_parent", "inherit_workspace": True}
 
 
 def test_run_slash_dispatch_dry_run_counts(kanban_home):

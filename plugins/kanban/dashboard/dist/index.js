@@ -2610,6 +2610,7 @@
     const [workspaceKind, setWorkspaceKind] = useState("scratch");
     const [workspacePath, setWorkspacePath] = useState("");
     const [projectPath, setProjectPath] = useState("");
+    const [inheritChildWorkspace, setInheritChildWorkspace] = useState(false);
 
     const submit = function () {
       const trimmed = title.trim();
@@ -2640,9 +2641,11 @@
       }
       const wpTrim = workspacePath.trim();
       if (workspaceKind !== "dir" && wpTrim) body.workspace_path = wpTrim;
+      if (inheritChildWorkspace) body.inherit_child_workspace = true;
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
       setWorkspaceKind("scratch"); setWorkspacePath(""); setProjectPath("");
+      setInheritChildWorkspace(false);
     };
 
     const showPathInput = workspaceKind !== "scratch";
@@ -2741,6 +2744,18 @@
           return h(SelectOption, { key: task.id, value: task.id },
             `${task.id} — ${(task.title || "").slice(0, 50)}`);
         }),
+      ),
+      h("label", {
+        className: "flex items-center gap-2 text-xs text-muted-foreground",
+        title: "When this task is decomposed, children inherit its workspace kind/path.",
+      },
+        h(Checkbox, {
+          checked: inheritChildWorkspace,
+          onCheckedChange: function (checked) {
+            setInheritChildWorkspace(checked === true);
+          },
+        }),
+        "Children inherit workspace",
       ),
       h("div", { className: "flex gap-2" },
         h(Button, {
@@ -2906,13 +2921,13 @@
     // of child tasks routed to specialist profiles by description.
     // Refreshes both the drawer (so the user sees the root flip to
     // todo) and the board (so the new children appear in the columns).
-    const doDecompose = function () {
+    const doDecompose = function (options) {
       return SDK.fetchJSON(
         withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/decompose`, boardSlug),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify(options || {}),
         }
       ).then(function (res) {
         load();
@@ -3183,10 +3198,7 @@
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
-        h(MetaRow, {
-          label: tx(i18n, "workspace", "Workspace"),
-          value: `${t.workspace_kind}${t.workspace_path ? ": " + t.workspace_path : ""}`,
-        }),
+        h(WorkspaceEditor, { task: t, onPatch: props.onPatch }),
         (t.skills && t.skills.length > 0) ? h(MetaRow, {
           label: tx(i18n, "skills", "Skills"),
           value: t.skills.join(", "),
@@ -3530,6 +3542,83 @@
     );
   }
 
+  function WorkspaceEditor(props) {
+    const { t } = useI18n();
+    const task = props.task;
+    const [editing, setEditing] = useState(false);
+    const [kind, setKind] = useState(task.workspace_kind || "scratch");
+    const [path, setPath] = useState(task.workspace_path || "");
+    const [inherit, setInherit] = useState(!!task.inherit_child_workspace);
+    useEffect(function () {
+      setKind(task.workspace_kind || "scratch");
+      setPath(task.workspace_path || "");
+      setInherit(!!task.inherit_child_workspace);
+    }, [task.workspace_kind, task.workspace_path, task.inherit_child_workspace]);
+    const value = `${task.workspace_kind || "scratch"}${task.workspace_path ? ": " + task.workspace_path : ""}`
+      + (task.inherit_child_workspace ? " · children inherit" : "");
+    if (!editing) {
+      return h("div", { className: "hermes-kanban-meta-row" },
+        h("span", { className: "hermes-kanban-meta-label" }, tx(t, "workspace", "Workspace")),
+        h("span", {
+          className: "hermes-kanban-meta-value hermes-kanban-editable",
+          onClick: function () { if (task.status !== "running") setEditing(true); },
+          title: task.status === "running"
+            ? "Workspace cannot be changed while a worker is running."
+            : tx(t, "clickToEdit", "Click to edit"),
+        }, value),
+      );
+    }
+    const save = function () {
+      const trimmed = path.trim();
+      props.onPatch({
+        workspace_kind: kind,
+        workspace_path: trimmed ? trimmed : null,
+        inherit_child_workspace: inherit,
+      }).then(function () { setEditing(false); });
+    };
+    return h("div", { className: "hermes-kanban-meta-row" },
+      h("span", { className: "hermes-kanban-meta-label" }, tx(t, "workspace", "Workspace")),
+      h("div", { className: "flex flex-col gap-2 flex-1" },
+        h("div", { className: "flex gap-2" },
+          h(Select, Object.assign({
+            value: kind,
+            className: "h-7 text-xs w-28",
+          }, selectChangeHandler(function (v) {
+            setKind(v);
+            if (v === "scratch") setPath("");
+          })),
+            h(SelectOption, { value: "scratch" }, "scratch"),
+            h(SelectOption, { value: "dir" }, "dir"),
+            h(SelectOption, { value: "worktree" }, "worktree"),
+          ),
+          h(Input, {
+            value: path,
+            disabled: kind === "scratch",
+            onChange: function (e) { setPath(e.target.value); },
+            placeholder: kind === "dir"
+              ? "absolute path required"
+              : "absolute path optional",
+            className: "h-7 text-xs flex-1",
+          }),
+        ),
+        h("div", { className: "flex items-center gap-2" },
+          h("label", { className: "flex items-center gap-2 text-xs text-muted-foreground" },
+            h(Checkbox, {
+              checked: inherit,
+              onCheckedChange: function (checked) { setInherit(checked === true); },
+            }),
+            "Children inherit workspace",
+          ),
+          h(Button, { onClick: save, size: "sm" }, tx(t, "save", "Save")),
+          h(Button, {
+            onClick: function () { setEditing(false); },
+            size: "sm",
+          }, tx(t, "cancel", "Cancel")),
+        ),
+      ),
+    );
+  }
+
   function BodyEditor(props) {
     const { t } = useI18n();
     const [editing, setEditing] = useState(false);
@@ -3673,6 +3762,12 @@
     const [specifyMsg, setSpecifyMsg] = useState(null);
     const [decomposeBusy, setDecomposeBusy] = useState(false);
     const [decomposeMsg, setDecomposeMsg] = useState(null);
+    const [decomposeInheritWorkspace, setDecomposeInheritWorkspace] = useState(
+      !!task.inherit_child_workspace
+    );
+    useEffect(function () {
+      setDecomposeInheritWorkspace(!!task.inherit_child_workspace);
+    }, [task.id, task.inherit_child_workspace]);
     const b = function (label, patch, enabled, confirmMsg) {
       return h(Button, {
         onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
@@ -3728,7 +3823,9 @@
             if (decomposeBusy) return;
             setDecomposeBusy(true);
             setDecomposeMsg(null);
-            props.onDecompose().then(function (res) {
+            props.onDecompose({
+              inherit_workspace: decomposeInheritWorkspace,
+            }).then(function (res) {
               if (res && res.ok) {
                 if (res.fanout && res.child_ids && res.child_ids.length) {
                   setDecomposeMsg({
@@ -3765,6 +3862,20 @@
       : null;
 
     return h("div", null,
+      task.status === "triage" && props.onDecompose
+        ? h("label", {
+            className: "flex items-center gap-2 text-xs text-muted-foreground mb-2",
+            title: "One-time choice for this decomposition. The task's saved preference is edited in Workspace.",
+          },
+            h(Checkbox, {
+              checked: decomposeInheritWorkspace,
+              onCheckedChange: function (checked) {
+                setDecomposeInheritWorkspace(checked === true);
+              },
+            }),
+            "Decomposed children inherit workspace",
+          )
+        : null,
       h("div", { className: "hermes-kanban-actions" },
         specifyButton,
         decomposeButton,
