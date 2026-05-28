@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_projects
 
 log = logging.getLogger(__name__)
 
@@ -563,6 +564,7 @@ class CreateTaskBody(BaseModel):
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
+    project: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -570,14 +572,24 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        workspace_kind = payload.workspace_kind
+        workspace_path = payload.workspace_path
+        if payload.project:
+            try:
+                from hermes_cli.config import load_config
+                project = kanban_projects.resolve_project(load_config() or {}, payload.project)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            workspace_kind = "dir"
+            workspace_path = project["path"]
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
             body=payload.body,
             assignee=payload.assignee,
             created_by="dashboard",
-            workspace_kind=payload.workspace_kind,
-            workspace_path=payload.workspace_path,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
@@ -1469,6 +1481,20 @@ def get_config():
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
         "render_markdown": bool(k_cfg.get("render_markdown", True)),
+    }
+
+
+@router.get("/projects")
+def get_projects():
+    """Return configured Kanban projects discovered from config roots."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    return {
+        "roots": kanban_projects.list_project_roots(cfg),
+        "projects": kanban_projects.list_projects(cfg),
     }
 
 

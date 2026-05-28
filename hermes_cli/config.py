@@ -1787,6 +1787,13 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Parent directories whose direct child directories should appear
+        # as selectable Kanban projects in the dashboard and CLI.
+        # Example:
+        #   projects_directories:
+        #     - ~/projects
+        #     - /opt/data/projects
+        "projects_directories": [],
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
