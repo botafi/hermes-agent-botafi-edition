@@ -61,6 +61,24 @@ def test_parse_workspace_flag_rejects(bad):
         kc._parse_workspace_flag(bad)
 
 
+def test_run_slash_create_project_resolves_configured_project(kanban_home, tmp_path):
+    projects_root = tmp_path / "projects"
+    project = projects_root / "alpha"
+    project.mkdir(parents=True)
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  projects_directories:\n    - " + projects_root.as_posix() + "\n",
+        encoding="utf-8",
+    )
+
+    out = kc.run_slash("create 'project task' --project alpha")
+    assert "Created" in out
+
+    with kb.connect() as conn:
+        tasks = kb.list_tasks(conn)
+    assert tasks[0].workspace_kind == "dir"
+    assert tasks[0].workspace_path == project.resolve().as_posix()
+
+
 def test_parse_branch_flag_rejects_empty_and_option_like():
     assert kc._parse_branch_flag(None) is None
     assert kc._parse_branch_flag(" wt/t6-wire ") == "wt/t6-wire"
