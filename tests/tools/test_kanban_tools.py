@@ -747,6 +747,12 @@ def test_comment_schema_omits_author_override():
     assert "author" not in props
 
 
+def test_create_schema_includes_child_workspace_inheritance():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+    props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert props["inherit_child_workspace"]["type"] == "boolean"
+
+
 def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
@@ -764,6 +770,27 @@ def test_create_happy_path(worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
         assert child.assignee == "peer"
+        assert child.inherit_child_workspace is False
+    finally:
+        conn.close()
+
+
+def test_create_accepts_child_workspace_inheritance(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "child task",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "inherit_child_workspace": True,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.inherit_child_workspace is True
     finally:
         conn.close()
 
