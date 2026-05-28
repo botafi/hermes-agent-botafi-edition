@@ -791,6 +791,35 @@ def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_project_resolves_configured_project(worker_env, tmp_path):
+    projects_root = tmp_path / "projects"
+    alpha = projects_root / "alpha"
+    alpha.mkdir(parents=True)
+    home = tmp_path / ".hermes"
+    (home / "config.yaml").write_text(
+        "kanban:\n  projects_directories:\n    - " + projects_root.as_posix() + "\n",
+        encoding="utf-8",
+    )
+
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "project child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "project": "alpha",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.workspace_kind == "dir"
+        assert new_task.workspace_path == alpha.resolve().as_posix()
+    finally:
+        conn.close()
+
+
 def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
     """An explicit ``session_id`` arg from the model wins over the env
     propagation. Edge case but exercised: a tool call could carry a
