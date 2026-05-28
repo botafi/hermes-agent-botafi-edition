@@ -114,6 +114,64 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_accepts_child_workspace_inheritance(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "parent", "inherit_child_workspace": True},
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["inherit_child_workspace"] is True
+
+
+def test_patch_task_workspace_persists_and_validates(client, tmp_path):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "workspace edit"},
+    ).json()["task"]
+    project = tmp_path / "mina-browser-bridge"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={
+            "workspace_kind": "dir",
+            "workspace_path": str(project),
+            "inherit_child_workspace": True,
+        },
+    )
+    assert r.status_code == 200, r.text
+    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
+    assert detail["workspace_kind"] == "dir"
+    assert detail["workspace_path"] == str(project)
+    assert detail["inherit_child_workspace"] is True
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"workspace_kind": "dir", "workspace_path": "relative/path"},
+    )
+    assert r.status_code == 400
+    assert "absolute" in r.text
+
+
+def test_patch_task_workspace_rejects_running_task(client, tmp_path):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "running workspace"},
+    ).json()["task"]
+    with kb.connect() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (t["id"],))
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={
+            "workspace_kind": "dir",
+            "workspace_path": str(tmp_path / "project"),
+        },
+    )
+    assert r.status_code == 409
+    assert "running" in r.text
+
+
 def test_projects_endpoint_discovers_configured_project_dirs(client, kanban_home, tmp_path):
     projects_root = tmp_path / "projects"
     alpha = projects_root / "alpha"
@@ -2136,6 +2194,40 @@ def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
     # Task must stay in triage — nothing was touched.
     detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
     assert detail["status"] == "triage"
+
+
+def test_decompose_endpoint_passes_workspace_override(client, monkeypatch, tmp_path):
+    import json as jsonlib
+
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "rough",
+            "triage": True,
+            "workspace_kind": "dir",
+            "workspace_path": str(tmp_path / "project"),
+            "inherit_child_workspace": False,
+        },
+    ).json()["task"]
+
+    _patch_specifier_response(
+        monkeypatch,
+        content=jsonlib.dumps({
+            "fanout": True,
+            "rationale": "split",
+            "tasks": [{"title": "child", "body": "do it", "assignee": "default", "parents": []}],
+        }),
+    )
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/decompose",
+        json={"inherit_workspace": True},
+    )
+    assert r.status_code == 200, r.text
+    child_id = r.json()["child_ids"][0]
+    detail = client.get(f"/api/plugins/kanban/tasks/{child_id}").json()["task"]
+    assert detail["workspace_kind"] == "dir"
+    assert detail["workspace_path"] == str(tmp_path / "project")
 
 
 def test_board_endpoint_accepts_explicit_board_default_param(client):

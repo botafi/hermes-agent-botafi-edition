@@ -66,6 +66,65 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
+    assert c0.workspace_kind == "scratch"
+    assert c0.workspace_path is None
+
+
+def test_decompose_inherits_parent_workspace_when_task_pref_enabled(kanban_home, tmp_path):
+    project = tmp_path / "mina-browser-bridge"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship a feature",
+            triage=True,
+            workspace_kind="dir",
+            workspace_path=str(project),
+            inherit_child_workspace=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "build it", "assignee": "engineer"}],
+            author="decomposer",
+        )
+
+    assert child_ids is not None
+    with kb.connect() as conn:
+        child = kb.get_task(conn, child_ids[0])
+    assert child.workspace_kind == "dir"
+    assert child.workspace_path == str(project)
+
+
+def test_decompose_manual_workspace_override_does_not_change_parent_pref(
+    kanban_home, tmp_path,
+):
+    project = tmp_path / "project"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship a feature",
+            triage=True,
+            workspace_kind="dir",
+            workspace_path=str(project),
+            inherit_child_workspace=False,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "build it", "assignee": "engineer"}],
+            author="decomposer",
+            inherit_workspace=True,
+        )
+
+    assert child_ids is not None
+    with kb.connect() as conn:
+        parent = kb.get_task(conn, tid)
+        child = kb.get_task(conn, child_ids[0])
+    assert parent.inherit_child_workspace is False
+    assert child.workspace_kind == "dir"
+    assert child.workspace_path == str(project)
 
 
 def test_decompose_returns_none_when_task_missing(kanban_home):
