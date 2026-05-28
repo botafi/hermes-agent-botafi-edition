@@ -467,6 +467,7 @@
     const [board, setBoard] = useState(() => readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
+    const [projects, setProjects] = useState([]);
 
     const [kanbanBoard, setKanbanBoard] = useState(null);  // the grid data
     // Alias so the rest of the function can keep using `board` semantically
@@ -521,6 +522,12 @@
         })
         .catch(function () { setConfig({ render_markdown: true }); });
     }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
+    useEffect(function () {
+      SDK.fetchJSON(`${API}/projects`)
+        .then(function (data) { setProjects((data && data.projects) || []); })
+        .catch(function () { setProjects([]); });
+    }, []);
 
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
@@ -1035,6 +1042,7 @@
           onOpen: setSelectedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          projects: projects,
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -2245,6 +2253,7 @@
           onOpen: props.onOpen,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
+          projects: props.projects || [],
         });
       }),
       h(TrashDropZone, {
@@ -2353,6 +2362,7 @@
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
+        projects: props.projects || [],
         onSubmit: function (body) {
           props.onCreate(body).then(function () { setShowCreate(false); });
         },
@@ -2596,10 +2606,10 @@
     const [skills, setSkills] = useState("");
     // Workspace controls. `scratch` (default) ignores path; `worktree` optionally
     // takes a path (dispatcher derives one from the assignee profile otherwise);
-    // `dir` requires a path. Backend enforces the rule — we only hide/show the
-    // input here to save vertical space in the common `scratch` case.
+    // `dir` uses a configured project from kanban.projects_directories.
     const [workspaceKind, setWorkspaceKind] = useState("scratch");
     const [workspacePath, setWorkspacePath] = useState("");
+    const [projectPath, setProjectPath] = useState("");
 
     const submit = function () {
       const trimmed = title.trim();
@@ -2624,18 +2634,21 @@
       if (workspaceKind && workspaceKind !== "scratch") {
         body.workspace_kind = workspaceKind;
       }
+      if (workspaceKind === "dir") {
+        if (!projectPath) return;
+        body.project = projectPath;
+      }
       const wpTrim = workspacePath.trim();
-      if (wpTrim) body.workspace_path = wpTrim;
+      if (workspaceKind !== "dir" && wpTrim) body.workspace_path = wpTrim;
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
-      setWorkspaceKind("scratch"); setWorkspacePath("");
+      setWorkspaceKind("scratch"); setWorkspacePath(""); setProjectPath("");
     };
 
     const showPathInput = workspaceKind !== "scratch";
-    const pathPlaceholder = workspaceKind === "dir"
-      ? tx(t, "workspacePathDir", "workspace path (required, e.g. ~/projects/my-app)")
-      : tx(t, "workspacePathOptional",
-          "workspace path (optional, derived from assignee if blank)");
+    const showProjectSelect = workspaceKind === "dir";
+    const pathPlaceholder = tx(t, "workspacePathOptional",
+      "workspace path (optional, derived from assignee if blank)");
 
     return h("div", { className: "hermes-kanban-inline-create" },
       h("textarea", {
@@ -2688,14 +2701,30 @@
       h("div", { className: "flex gap-2" },
         h(Select, Object.assign({
           value: workspaceKind,
-          title: "scratch: isolated temp dir (default). worktree: git worktree on the assignee profile. dir: exact path (required below).",
+          title: "scratch: isolated temp dir (default). worktree: git worktree on the assignee profile. dir: configured project directory.",
           className: "h-7 text-xs w-28",
-        }, selectChangeHandler(setWorkspaceKind)),
+        }, selectChangeHandler(function (v) {
+          setWorkspaceKind(v);
+          if (v !== "dir") setProjectPath("");
+        })),
           h(SelectOption, { value: "scratch" }, "scratch"),
           h(SelectOption, { value: "worktree" }, "worktree"),
-          h(SelectOption, { value: "dir" }, "dir"),
+          h(SelectOption, { value: "dir" }, "project"),
         ),
-        showPathInput ? h(Input, {
+        showProjectSelect ? h(Select, Object.assign({
+          value: projectPath,
+          className: "h-7 text-xs flex-1",
+          title: "Project directories are discovered from kanban.projects_directories in config.yaml.",
+        }, selectChangeHandler(setProjectPath)),
+          h(SelectOption, { value: "" },
+            (props.projects || []).length
+              ? tx(t, "selectProject", "select project")
+              : tx(t, "noProjectsConfigured", "no configured projects")),
+          (props.projects || []).map(function (project) {
+            return h(SelectOption, { key: project.path, value: project.path },
+              project.label || project.name || project.path);
+          }),
+        ) : showPathInput ? h(Input, {
           value: workspacePath,
           onChange: function (e) { setWorkspacePath(e.target.value); },
           placeholder: pathPlaceholder,
@@ -2717,6 +2746,7 @@
         h(Button, {
           onClick: submit,
           size: "sm",
+          disabled: workspaceKind === "dir" && !projectPath,
         }, "Create"),
         h(Button, {
           onClick: props.onCancel,
