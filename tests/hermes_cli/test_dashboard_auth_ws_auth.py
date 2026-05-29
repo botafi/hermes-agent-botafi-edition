@@ -49,9 +49,11 @@ def gated_app():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
     web_server.app.state.bound_host = "fly-app.fly.dev"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
+    web_server.app.state.allow_public = False
     client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     yield client
     clear_providers()
@@ -59,6 +61,7 @@ def gated_app():
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
 
 
 @pytest.fixture
@@ -69,15 +72,40 @@ def loopback_app():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
     web_server.app.state.bound_host = "127.0.0.1"
     web_server.app.state.bound_port = 8080
     web_server.app.state.auth_required = False
+    web_server.app.state.allow_public = False
     client = TestClient(web_server.app, base_url="http://127.0.0.1:8080")
     yield client
     _reset_for_tests()
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
+
+
+@pytest.fixture
+def insecure_public_app():
+    """web_server.app configured for public --insecure token mode."""
+    _reset_for_tests()
+    clear_providers()
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
+    web_server.app.state.bound_host = "0.0.0.0"
+    web_server.app.state.bound_port = 8080
+    web_server.app.state.auth_required = False
+    web_server.app.state.allow_public = True
+    client = TestClient(web_server.app, base_url="http://192.168.1.10:8080")
+    yield client
+    _reset_for_tests()
+    web_server.app.state.bound_host = prev_host
+    web_server.app.state.bound_port = prev_port
+    web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
 
 
 def _logged_in(client: TestClient) -> None:
@@ -279,6 +307,14 @@ class TestWsRequestIsAllowedGated:
     def test_loopback_peer_allowed_in_loopback_mode(self, loopback_app):
         ws = _fake_ws(query={}, client_host="127.0.0.1")
         ws.headers = {"host": "127.0.0.1:8080"}
+        assert web_server._ws_request_is_allowed(ws) is True
+
+    def test_non_loopback_peer_allowed_in_insecure_public_mode(self, insecure_public_app):
+        ws = _fake_ws(query={}, client_host="192.168.1.42")
+        ws.headers = {
+            "host": "192.168.1.10:8080",
+            "origin": "http://192.168.1.10:8080",
+        }
         assert web_server._ws_request_is_allowed(ws) is True
 
     def test_host_origin_guard_still_runs_in_gated_mode(self, gated_app):

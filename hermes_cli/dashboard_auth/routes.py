@@ -11,7 +11,7 @@ The routes:
   GET  /auth/callback?code,state → completes login, sets session cookies
   POST /auth/logout        → clears cookies, best-effort revoke
   GET  /api/auth/providers → list registered providers (login bootstrap)
-  GET  /api/auth/me        → current Session as JSON (auth-required)
+  GET  /api/auth/me        → current Session or legacy dashboard token identity
 """
 from __future__ import annotations
 
@@ -406,9 +406,21 @@ async def auth_logout(request: Request):
 
 @router.get("/api/auth/me", name="auth_me")
 async def api_auth_me(request: Request):
-    """Return the verified session as JSON. Auth-required (gate enforces)."""
+    """Return the verified OAuth session or legacy dashboard-token identity."""
     sess = getattr(request.state, "session", None)
     if sess is None:
+        if not getattr(request.app.state, "auth_required", False):
+            from hermes_cli.web_server import _has_valid_session_token
+
+            if _has_valid_session_token(request):
+                return {
+                    "user_id": "dashboard-session",
+                    "email": "",
+                    "display_name": "Dashboard session",
+                    "org_id": "",
+                    "provider": "session-token",
+                    "expires_at": 0,
+                }
         raise HTTPException(status_code=401, detail="Unauthorized")
     return {
         "user_id": sess.user_id,
