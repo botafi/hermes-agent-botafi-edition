@@ -3384,8 +3384,14 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     OAuth gate + single-use ``?ticket=`` is the auth at that point; the
     Host/Origin guard in :func:`_ws_host_origin_is_allowed` is what
     blocks DNS-rebinding here, not the peer IP.
+
+    Public insecure mode: ``--insecure`` is an explicit operator opt-in to
+    reach the dashboard from non-loopback hosts while still using the injected
+    session token.  In that mode, do not apply the loopback peer-IP guard.
     """
     if getattr(app.state, "auth_required", False):
+        return True
+    if getattr(app.state, "allow_public", False):
         return True
     client_host = ws.client.host if ws.client else ""
     if not client_host:
@@ -4841,6 +4847,7 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host, allow_public)
+    app.state.allow_public = bool(allow_public)
 
     if app.state.auth_required:
         # Phase 3.5: the gate engages on non-loopback binds.  The legacy
