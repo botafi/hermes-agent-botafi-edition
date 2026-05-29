@@ -1,9 +1,63 @@
-Adds OpenAI hosted tool search support for Responses providers, with configurable tool namespaces and MCP server descriptions.
+# Downstream changelog vs upstream/main
 
+This branch is currently 11 commits ahead of `upstream/main`. The downstream
+changes are grouped below by feature area rather than commit order.
 
-## Hosted tool search and namespaces
+## Dashboard terminal and web security
 
-Adds support for OpenAI Responses API hosted `tool_search` on providers and models that support deferred tool loading. Hermes now keeps required tools present in the request and groups the rest into short namespaces with `defer_loading=true`.
+- Adds an optional `/terminal` dashboard page backed by `@wterm/react` and a
+  Ghostty terminal core.
+- Adds authenticated `/api/terminal/pty` and `/api/terminal/containers`
+  endpoints for host-shell and Docker-container terminal sessions.
+- Gates dashboard terminal access behind `HERMES_DASHBOARD_TERMINAL` rather
+  than a persistent config key, because shell access is an operator choice.
+- Tracks dashboard PTY sessions server-side with reconnect grace, duplicate
+  attachment protection, resize forwarding, cleanup, and active-session limits.
+- Hardens dashboard auth by requiring the ephemeral dashboard token on sensitive
+  API and WebSocket paths, accepting it through the dedicated
+  `X-Hermes-Session-Token` header and preserving Bearer-token compatibility.
+- Adds Host-header validation for loopback dashboard binds to reduce DNS
+  rebinding exposure.
+
+## Kanban project and workspace improvements
+
+- Adds configurable project discovery via `kanban.projects_directories`.
+  Kanban tasks can now select a configured project by name, label, or path; the
+  selected project becomes a `dir` workspace.
+- Adds workspace metadata to kanban tasks:
+  `workspace_kind`, `workspace_path`, and `inherit_child_workspace`.
+- Adds CLI and tool support for explicit workspaces:
+  `--workspace`, `--project`, `--inherit-child-workspace`, and decomposition
+  flags for inheriting or resetting child workspaces.
+- Allows task workspaces to be updated before a worker starts, while refusing
+  live worker cwd changes.
+- Persists resolved workspace paths and includes workspace data in kanban
+  output, dashboard plugin responses, and kanban tool payloads.
+- Improves scratch-workspace cleanup safety and emits a first-use tip explaining
+  that scratch workspaces are ephemeral.
+
+## OpenAI Responses hosted tool search
+
+- Adds support for OpenAI Responses API hosted `tool_search` on providers and
+  models that support deferred tool loading.
+- Keeps required tools always present in the request and groups the rest into
+  short Hermes namespaces with `defer_loading=true`.
+- Uses `hermes_*` namespace names for built-in tools to avoid collisions with
+  OpenAI reserved hosted-tool namespaces such as `web`.
+- Maps MCP toolsets to `mcp_<server_name>` namespaces and supports short MCP
+  server descriptions in config, `hermes mcp add --description`, `mcp list`,
+  and `mcp test`.
+- Adds `tools.hosted_search` config for global/provider/model gating,
+  namespace descriptions, per-tool namespace overrides, and always-present
+  overrides.
+- Enables the default policy only for known OpenAI Responses surfaces
+  (`openai-api` and ChatGPT Codex OAuth) and allowed model patterns; compatible
+  proxies stay off unless explicitly opted in.
+- Falls back to flat tool schemas if a provider rejects `tool_search`,
+  `namespace`, or `defer_loading` with an explicit schema-style 4xx response.
+- Preserves `tool_search_call`, `tool_search_output`, and function-call
+  `namespace` records so stored Responses history can replay deferred tool
+  calls correctly.
 
 Always-present tools default to:
 
@@ -13,79 +67,51 @@ Always-present tools default to:
 - `execute_code`
 - `session_search`
 
-Other built-in tools are grouped by practical area using `hermes_*` namespace names, such as `hermes_filesystem`, `hermes_web`, `hermes_browser`, `hermes_media`, `hermes_skills`, `hermes_automation`, `hermes_messaging`, `hermes_smart_home`, and `hermes_core`. The prefix avoids collisions with OpenAI hosted-tool namespaces such as `web`.
+## Terminal and file backend controls
 
-### MCP namespace support
+- Adds a per-call `backend` override to `terminal`, currently limited to
+  `local` and `docker`.
+- Splits terminal environment caches and lifecycle cleanup by `(task_id,
+  backend)` so local and Docker sessions do not collide.
+- Adds `terminal.docker_cwd` as a Docker-only default working directory.
+  Precedence is per-call `workdir`, then `terminal.docker_cwd` for Docker, then
+  `terminal.cwd`.
+- Adds optional `backend` overrides to `read_file`, `write_file`, `patch`, and
+  `search_files`, also limited to `local` and `docker`.
+- Routes file tools through the selected backend's live cwd and home handling,
+  including relative paths and `~` paths.
+- Keeps `execute_code` sandboxed by design; it does not expose a backend
+  override that could request host filesystem or terminal access.
 
-MCP servers now map to hosted-search namespaces using `mcp_<server_name>`. For example, a configured `github` MCP server becomes the `mcp_github` namespace.
+## Approval-flow hardening
 
-Each MCP server can now carry a short config description:
+- Adds a dedicated `file_backend_local` approval kind for file tools that
+  explicitly request `backend="local"` while the configured default backend is
+  Docker.
+- Prevents stale permanent dangerous-command allowlist entries from bypassing
+  local-backend file approvals.
+- Makes file-tool approval choices session-scoped:
+  **Allow Session** approves the same file tool type, and
+  **Allow All File Tools** approves all local-backend file tools for the current
+  session.
+- Coalesces concurrent sibling approvals of the same file-tool type in a
+  session, while keeping other file tools and dangerous-command prompts
+  separate.
+- Updates gateway, Discord button approvals, and TUI approval prompts to expose
+  file-specific approval choices.
 
-```yaml
-mcp_servers:
-  github:
-    description: "GitHub repository, issue, and pull request tools."
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-```
+## Gateway context dump command
 
-`hermes mcp add` accepts `--description`, and `hermes mcp list` / `hermes mcp test` display it. Hosted tool-search namespace descriptions inherit `mcp_servers.<name>.description` unless overridden in `tools.hosted_search.namespaces`.
+- Adds `/context-dump` as a gateway command, gated by
+  `gateway.context_dump.enabled`.
+- Captures the last provider request payload for a gateway session when enabled.
+- Saves dumps under `~/.hermes/debug/context_dumps/` and uploads them through
+  the platform adapter when file upload is available.
 
-### Provider and model gating
+## Tests, docs, and config coverage
 
-Hosted tool search is configurable under `tools.hosted_search`:
-
-- `enabled: auto | true | false`
-- per-provider `enabled`
-- per-provider `model_allow` and `model_deny`
-- per-namespace descriptions
-- per-tool `namespace` and `always_present` overrides
-
-The default policy is conservative. Real OpenAI Responses surfaces (`openai-api` on `api.openai.com` and `openai-codex` on ChatGPT Codex OAuth) are enabled only for allowed model patterns. OpenAI-compatible proxies remain off unless explicitly opted in per provider/model.
-
-If a provider rejects `tool_search`, `namespace`, or `defer_loading` with an explicit 4xx schema error, Hermes disables hosted tool search for the current session and retries with flat tool schemas. Non-HTTP errors and transient failures do not disable the feature.
-
-### Replay and performance hardening
-
-Responses history now preserves `tool_search_call`, `tool_search_output`, and function-call `namespace` records so deferred namespace tool calls can be replayed correctly with `store=false`.
-
-Hosted-search config is loaded once per Responses request and passed into registry metadata lookup, avoiding repeated config file reads for every tool schema.
-
-
-## Docker-default tool ergonomics
-
-Adds two related capabilities for deployments that use a containerized terminal backend by default while keeping an explicit local backend available for control-plane work.
-
-### Docker-specific default working directory
-
-`terminal.docker_cwd` provides a Docker-only default working directory. This avoids overloading the global `terminal.cwd`, which is still used by the local backend and other non-Docker backends.
-
-Precedence is:
-
-1. Per-call `workdir` wins.
-2. Docker backend uses `terminal.docker_cwd` when configured.
-3. Otherwise the tool falls back to `terminal.cwd`.
-4. Local backend ignores `terminal.docker_cwd`.
-
-This lets a deployment choose a sandbox-friendly default cwd without breaking explicit local/backend override calls.
-
-### File tool backend override with approval gating
-
-File tools (`read_file`, `write_file`, `patch`, `search_files`) now accept an optional `backend` parameter limited to `"local"` or `"docker"`. When omitted, file tools continue to use the configured default terminal backend.
-
-If the configured default backend is Docker and a file tool explicitly requests `backend="local"`, the operation is routed through the approval flow instead of silently escaping the sandbox. This applies to both read-style and mutation-style local file operations. Docker/default file operations remain sandboxed and do not require local approval.
-
-The `execute_code` sandbox intentionally does not expose the `backend` override, so sandboxed Python cannot request local file or terminal access.
-
-#### Approval UX and scoping hardening
-
-Local-backend file approvals are now scoped as their own approval kind (`file_backend_local`) instead of sharing the generic dangerous-command approval bucket. This keeps file-tool approval choices from accidentally resolving unrelated pending command approvals in the same gateway session.
-
-Gateway UIs expose file-specific approval choices:
-
-- **Allow Session** approves future local-backend calls for the same file tool type, such as `read_file`.
-- **Allow All File Tools** approves local-backend access for all file tools for the current session only.
-
-File-tool approval checks intentionally consult session approvals only. Stale permanent `command_allowlist` entries such as `file:*` or `file:backend:local:any` do not bypass the local filesystem escape-hatch approval.
-
-Concurrent same-type prompts are also coalesced: approving one queued local-backend `read_file` prompt for the session resolves sibling queued `read_file` prompts, while different file tools and dangerous-command prompts remain pending for separate decisions.
+- Adds and updates tests for terminal/file backend overrides, approval scoping,
+  Responses hosted tool search, dashboard auth, dashboard terminals, kanban
+  project/workspace behavior, MCP descriptions, and `/context-dump`.
+- Updates `cli-config.yaml.example`, default config, MCP reference docs, and
+  kanban user docs for the new downstream options.
