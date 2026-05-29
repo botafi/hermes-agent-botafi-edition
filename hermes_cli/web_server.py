@@ -23,6 +23,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -91,6 +92,12 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 # In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
 # or HERMES_DASHBOARD_TUI=1.  Set from :func:`start_server`.
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = False
+
+# In-browser host/container shell terminal.  This is intentionally gated by an
+# environment variable, not config.yaml: shell access is sensitive and should be
+# an operator/deployment choice that an agent cannot casually persist.
+_DASHBOARD_TERMINAL_ENV = "HERMES_DASHBOARD_TERMINAL"
+_DASHBOARD_TERMINAL_GRACE_ENV = "HERMES_DASHBOARD_TERMINAL_RECONNECT_GRACE_SECONDS"
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -3707,6 +3714,456 @@ async def pty_ws(ws: WebSocket) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /api/terminal/* — gated host/container shell terminal for the dashboard.
+#
+# This is deliberately separate from /api/pty above.  /api/pty owns the
+# embedded Hermes chat TUI contract; /api/terminal/pty is a general-purpose
+# shell bridge with reconnect grace and Docker exec support.
+# ---------------------------------------------------------------------------
+
+_TERMINAL_SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{16,160}$")
+_TERMINAL_CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_TERMINAL_MAX_SESSIONS = 16
+
+
+def _dashboard_terminal_enabled() -> bool:
+    return env_var_enabled(_DASHBOARD_TERMINAL_ENV)
+
+
+def _terminal_reconnect_grace_seconds() -> float:
+    raw = os.getenv(_DASHBOARD_TERMINAL_GRACE_ENV, "30")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 30.0
+    return max(0.0, min(value, 3600.0))
+
+
+def _terminal_error_frame(message: str) -> str:
+    return f"\r\n\x1b[31m{message}\x1b[0m\r\n"
+
+
+def _terminal_shell_argv() -> list[str]:
+    shell = os.getenv("SHELL") or "/bin/sh"
+    argv = [shell]
+    if Path(shell).name in {"bash", "zsh", "sh", "fish", "ksh"}:
+        argv.append("-l")
+    return argv
+
+
+def _terminal_cwd() -> Optional[str]:
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = None
+    configured = cfg_get(cfg, "terminal", "cwd", default=None)
+    if isinstance(configured, str) and configured.strip():
+        expanded = os.path.expanduser(os.path.expandvars(configured.strip()))
+        if os.path.isdir(expanded):
+            return expanded
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+def _docker_container_valid(container: str) -> bool:
+    return bool(_TERMINAL_CONTAINER_RE.match(container))
+
+
+def _docker_shell(container: str) -> str:
+    """Return a shell path available in the container, preferring bash."""
+    if not _docker_container_valid(container):
+        raise ValueError("Invalid Docker container id or name.")
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "exec",
+                container,
+                "sh",
+                "-lc",
+                "command -v bash || command -v sh || printf /bin/sh",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Docker shell probe timed out.") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "docker exec failed").strip()
+        raise RuntimeError(detail)
+    shell = (proc.stdout or "/bin/sh").splitlines()[0].strip() or "/bin/sh"
+    return shell
+
+
+def _resolve_terminal_argv(mode: str, container: Optional[str] = None) -> tuple[list[str], Optional[str], dict]:
+    env = os.environ.copy()
+    env.setdefault("TERM", "xterm-256color")
+    if mode == "host":
+        return _terminal_shell_argv(), _terminal_cwd(), env
+    if mode == "docker":
+        if not container:
+            raise ValueError("Docker container is required.")
+        shell = _docker_shell(container)
+        return ["docker", "exec", "-it", container, shell], _terminal_cwd(), env
+    raise ValueError("Terminal mode must be 'host' or 'docker'.")
+
+
+@dataclass
+class _TerminalSession:
+    session_id: str
+    identity: tuple[str, str]
+    bridge: Any
+    argv: list[str]
+    cwd: Optional[str]
+    created_at: float = field(default_factory=time.monotonic)
+    last_detached_at: Optional[float] = None
+    active: bool = False
+    cleanup_task: Optional[asyncio.Task] = None
+
+
+class _TerminalSessionRegistry:
+    def __init__(self, max_sessions: int = _TERMINAL_MAX_SESSIONS):
+        self.max_sessions = max_sessions
+        self.sessions: dict[str, _TerminalSession] = {}
+        self.lock = asyncio.Lock()
+        self._sweeper_task: Optional[asyncio.Task] = None
+
+    def ensure_sweeper(self) -> None:
+        if self._sweeper_task and not self._sweeper_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sweeper_task = loop.create_task(self._sweep_loop())
+
+    async def _sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            await self.sweep()
+
+    async def sweep(self) -> None:
+        stale: list[_TerminalSession] = []
+        now = time.monotonic()
+        grace = _terminal_reconnect_grace_seconds()
+        async with self.lock:
+            for session_id, session in list(self.sessions.items()):
+                detached_expired = (
+                    not session.active
+                    and session.last_detached_at is not None
+                    and now - session.last_detached_at >= grace
+                )
+                if detached_expired or not session.bridge.is_alive():
+                    stale.append(self.sessions.pop(session_id))
+        await self._close_sessions(stale)
+
+    async def acquire(
+        self,
+        session_id: str,
+        identity: tuple[str, str],
+        argv: list[str],
+        cwd: Optional[str],
+        env: dict,
+    ) -> _TerminalSession:
+        self.ensure_sweeper()
+        to_close: list[_TerminalSession] = []
+        async with self.lock:
+            existing = self.sessions.get(session_id)
+            if existing and existing.identity == identity and existing.bridge.is_alive():
+                if existing.active:
+                    raise RuntimeError("Terminal session is already attached.")
+                if existing.cleanup_task:
+                    existing.cleanup_task.cancel()
+                    existing.cleanup_task = None
+                existing.active = True
+                existing.last_detached_at = None
+                return existing
+
+            if existing:
+                to_close.append(self.sessions.pop(session_id))
+
+            await self._evict_for_capacity_locked(to_close)
+
+            if len(self.sessions) >= self.max_sessions:
+                raise RuntimeError("Too many active dashboard terminal sessions.")
+
+            # Close replaced/evicted sessions before spawning the replacement.
+            # Holding the registry lock here is intentional: it prevents a
+            # second socket from reusing a session that is already selected for
+            # teardown, and the close path is bounded by PtyBridge.close().
+            await self._close_sessions(to_close)
+            to_close = []
+
+            bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)  # type: ignore[union-attr]
+            session = _TerminalSession(
+                session_id=session_id,
+                identity=identity,
+                bridge=bridge,
+                argv=list(argv),
+                cwd=cwd,
+                active=True,
+            )
+            self.sessions[session_id] = session
+
+        await self._close_sessions(to_close)
+        return session
+
+    async def detach(self, session: _TerminalSession) -> None:
+        grace = _terminal_reconnect_grace_seconds()
+        to_close: list[_TerminalSession] = []
+        async with self.lock:
+            current = self.sessions.get(session.session_id)
+            if current is not session:
+                return
+            session.active = False
+            session.last_detached_at = time.monotonic()
+            if session.cleanup_task:
+                session.cleanup_task.cancel()
+                session.cleanup_task = None
+            if grace <= 0 or not session.bridge.is_alive():
+                to_close.append(self.sessions.pop(session.session_id))
+            else:
+                session.cleanup_task = asyncio.create_task(
+                    self._close_after_grace(session.session_id, grace)
+                )
+        await self._close_sessions(to_close)
+
+    async def close(self, session_id: str) -> None:
+        to_close: list[_TerminalSession] = []
+        async with self.lock:
+            session = self.sessions.pop(session_id, None)
+            if session:
+                to_close.append(session)
+        await self._close_sessions(to_close)
+
+    async def _close_after_grace(self, session_id: str, grace: float) -> None:
+        try:
+            await asyncio.sleep(grace)
+        except asyncio.CancelledError:
+            return
+        to_close: list[_TerminalSession] = []
+        async with self.lock:
+            session = self.sessions.get(session_id)
+            if session and not session.active:
+                to_close.append(self.sessions.pop(session_id))
+        await self._close_sessions(to_close)
+
+    async def _evict_for_capacity_locked(self, to_close: list[_TerminalSession]) -> None:
+        if len(self.sessions) < self.max_sessions:
+            return
+        candidates = sorted(
+            (
+                s
+                for s in self.sessions.values()
+                if not s.active or not s.bridge.is_alive()
+            ),
+            key=lambda s: s.last_detached_at or s.created_at,
+        )
+        while len(self.sessions) >= self.max_sessions and candidates:
+            victim = candidates.pop(0)
+            if self.sessions.pop(victim.session_id, None) is victim:
+                to_close.append(victim)
+
+    async def _close_sessions(self, sessions: list[_TerminalSession]) -> None:
+        for session in sessions:
+            if session.cleanup_task:
+                session.cleanup_task.cancel()
+                session.cleanup_task = None
+            try:
+                await asyncio.to_thread(session.bridge.close)
+            except Exception:
+                _log.warning(
+                    "dashboard terminal session cleanup failed for %s",
+                    session.session_id,
+                    exc_info=True,
+                )
+
+
+_terminal_sessions = _TerminalSessionRegistry()
+
+
+@app.get("/api/terminal/containers")
+async def terminal_containers():
+    if not _dashboard_terminal_enabled():
+        raise HTTPException(status_code=404, detail="Dashboard terminal is disabled.")
+
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "--format", "{{json .}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return {"enabled": True, "containers": [], "error": "Docker command not found."}
+    except subprocess.TimeoutExpired:
+        return {"enabled": True, "containers": [], "error": "Docker command timed out."}
+    except OSError as exc:
+        return {"enabled": True, "containers": [], "error": str(exc)}
+
+    if proc.returncode != 0:
+        return {
+            "enabled": True,
+            "containers": [],
+            "error": (proc.stderr or proc.stdout or "Docker command failed.").strip(),
+        }
+
+    containers = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        containers.append(
+            {
+                "id": row.get("ID", ""),
+                "name": row.get("Names", ""),
+                "image": row.get("Image", ""),
+                "status": row.get("Status", ""),
+            }
+        )
+    return {"enabled": True, "containers": containers, "error": None}
+
+
+@app.websocket("/api/terminal/pty")
+async def terminal_pty_ws(ws: WebSocket) -> None:
+    if not _dashboard_terminal_enabled():
+        await ws.close(code=4403)
+        return
+
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    session_id = ws.query_params.get("session") or ""
+    if not _TERMINAL_SESSION_RE.match(session_id):
+        await ws.close(code=1008)
+        return
+
+    mode = ws.query_params.get("mode") or "host"
+    container = ws.query_params.get("container") or None
+    if container and not _docker_container_valid(container):
+        await ws.close(code=1008)
+        return
+
+    await ws.accept()
+
+    if not _PTY_BRIDGE_AVAILABLE:
+        await ws.send_text(
+            _terminal_error_frame(
+                "Terminal unavailable: a POSIX PTY is required. Use WSL2 on Windows."
+            )
+        )
+        await ws.close(code=1011)
+        return
+
+    try:
+        argv, cwd, env = _resolve_terminal_argv(mode, container)
+        identity = (mode, container or "")
+        session = await _terminal_sessions.acquire(
+            session_id=session_id,
+            identity=identity,
+            argv=argv,
+            cwd=cwd,
+            env=env,
+        )
+    except PtyUnavailableError as exc:
+        await ws.send_text(_terminal_error_frame(f"Terminal unavailable: {exc}"))
+        await ws.close(code=1011)
+        return
+    except RuntimeError as exc:
+        code = 4409 if "already attached" in str(exc) else 1011
+        await ws.send_text(_terminal_error_frame(str(exc)))
+        await ws.close(code=code)
+        return
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        await ws.send_text(_terminal_error_frame(f"Terminal failed to start: {exc}"))
+        await ws.close(code=1011)
+        return
+
+    loop = asyncio.get_running_loop()
+
+    async def pump_pty_to_ws() -> None:
+        while True:
+            chunk = await loop.run_in_executor(
+                None, session.bridge.read, _PTY_READ_CHUNK_TIMEOUT
+            )
+            if chunk is None:
+                return
+            if not chunk:
+                await asyncio.sleep(0)
+                continue
+            try:
+                await ws.send_bytes(chunk)
+            except Exception:
+                return
+
+    async def pump_ws_to_pty() -> None:
+        while True:
+            msg = await ws.receive()
+            msg_type = msg.get("type")
+            if msg_type == "websocket.disconnect":
+                return
+            raw = msg.get("bytes")
+            if raw is None:
+                text = msg.get("text")
+                raw = text.encode("utf-8") if isinstance(text, str) else b""
+            if not raw:
+                continue
+
+            match = _RESIZE_RE.match(raw)
+            if match and match.end() == len(raw):
+                session.bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
+                continue
+
+            session.bridge.write(raw)
+
+    reader_task = asyncio.create_task(pump_pty_to_ws())
+    writer_task = asyncio.create_task(pump_ws_to_pty())
+    tasks = {reader_task, writer_task}
+
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if reader_task in done and not writer_task.done():
+            close_code = 1000
+            try:
+                reader_task.result()
+            except Exception:
+                close_code = 1011
+                _log.warning(
+                    "dashboard terminal PTY reader failed for %s",
+                    session.session_id,
+                    exc_info=True,
+                )
+            try:
+                await ws.close(code=close_code)
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await _terminal_sessions.detach(session)
+
+
+# ---------------------------------------------------------------------------
 # /api/ws — JSON-RPC WebSocket sidecar for the dashboard "Chat" tab.
 #
 # Drives the same `tui_gateway.dispatch` surface Ink uses over stdio, so the
@@ -3870,12 +4327,14 @@ def mount_spa(application: FastAPI):
         """
         html = _index_path.read_text()
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
+        terminal_js = "true" if _dashboard_terminal_enabled() else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
         if gated:
             bootstrap_script = (
                 f"<script>"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+                f"window.__HERMES_DASHBOARD_TERMINAL__={terminal_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
                 f"</script>"
@@ -3884,6 +4343,7 @@ def mount_spa(application: FastAPI):
             bootstrap_script = (
                 f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+                f"window.__HERMES_DASHBOARD_TERMINAL__={terminal_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
                 f"</script>"
