@@ -38,9 +38,11 @@ def gated_app():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
     web_server.app.state.bound_host = "fly-app.fly.dev"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
+    web_server.app.state.allow_public = False
     # Use https base_url so cookies pick up Secure flag and host_header
     # matches the bound interface.
     client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
@@ -49,6 +51,28 @@ def gated_app():
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
+
+
+@pytest.fixture
+def insecure_public_app():
+    """Configure web_server.app for public --insecure token-auth mode."""
+    clear_providers()
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
+    web_server.app.state.bound_host = "0.0.0.0"
+    web_server.app.state.bound_port = 8080
+    web_server.app.state.auth_required = False
+    web_server.app.state.allow_public = True
+    client = TestClient(web_server.app, base_url="http://192.168.1.10:8080")
+    yield client
+    clear_providers()
+    web_server.app.state.bound_host = prev_host
+    web_server.app.state.bound_port = prev_port
+    web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +319,17 @@ def test_api_auth_me_requires_auth(gated_app):
     # No cookies.
     r = gated_app.get("/api/auth/me")
     assert r.status_code == 401
+
+
+def test_api_auth_me_accepts_session_token_in_insecure_public_mode(insecure_public_app):
+    r = insecure_public_app.get(
+        "/api/auth/me",
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["user_id"] == "dashboard-session"
+    assert body["provider"] == "session-token"
 
 
 # ---------------------------------------------------------------------------
