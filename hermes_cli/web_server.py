@@ -3762,19 +3762,22 @@ def _docker_shell(container: str) -> str:
     """Return a shell path available in the container, preferring bash."""
     if not _docker_container_valid(container):
         raise ValueError("Invalid Docker container id or name.")
-    proc = subprocess.run(
-        [
-            "docker",
-            "exec",
-            container,
-            "sh",
-            "-lc",
-            "command -v bash || command -v sh || printf /bin/sh",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "exec",
+                container,
+                "sh",
+                "-lc",
+                "command -v bash || command -v sh || printf /bin/sh",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Docker shell probe timed out.") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "docker exec failed").strip()
         raise RuntimeError(detail)
@@ -4092,14 +4095,12 @@ async def terminal_pty_ws(ws: WebSocket) -> None:
             except Exception:
                 return
 
-    reader_task = asyncio.create_task(pump_pty_to_ws())
-
-    try:
+    async def pump_ws_to_pty() -> None:
         while True:
             msg = await ws.receive()
             msg_type = msg.get("type")
             if msg_type == "websocket.disconnect":
-                break
+                return
             raw = msg.get("bytes")
             if raw is None:
                 text = msg.get("text")
@@ -4113,14 +4114,39 @@ async def terminal_pty_ws(ws: WebSocket) -> None:
                 continue
 
             session.bridge.write(raw)
+
+    reader_task = asyncio.create_task(pump_pty_to_ws())
+    writer_task = asyncio.create_task(pump_ws_to_pty())
+    tasks = {reader_task, writer_task}
+
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if reader_task in done and not writer_task.done():
+            close_code = 1000
+            try:
+                reader_task.result()
+            except Exception:
+                close_code = 1011
+                _log.warning(
+                    "dashboard terminal PTY reader failed for %s",
+                    session.session_id,
+                    exc_info=True,
+                )
+            try:
+                await ws.close(code=close_code)
+            except Exception:
+                pass
     except WebSocketDisconnect:
         pass
     finally:
-        reader_task.cancel()
-        try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         await _terminal_sessions.detach(session)
 
 

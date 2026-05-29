@@ -2497,6 +2497,38 @@ class TestDashboardTerminalWebSocket:
         asyncio.run(self.ws_module._terminal_sessions._close_after_grace(session_id, 0))
         assert session_id not in self.ws_module._terminal_sessions.sessions
 
+    def test_pty_eof_closes_websocket(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_terminal_argv",
+            lambda mode, container=None: (
+                ["/bin/sh", "-c", "printf terminal-eof-done"],
+                None,
+                os.environ.copy(),
+            ),
+        )
+        from starlette.websockets import WebSocketDisconnect
+
+        session_id = "term-test-session-eof"
+        with self.client.websocket_connect(self._url(session=session_id)) as conn:
+            buf = b""
+            import time
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                frame = conn.receive_bytes()
+                if frame:
+                    buf += frame
+                if b"terminal-eof-done" in buf:
+                    break
+            assert b"terminal-eof-done" in buf
+
+            with pytest.raises(WebSocketDisconnect) as exc:
+                conn.receive_bytes()
+            assert exc.value.code == 1000
+
+        assert session_id not in self.ws_module._terminal_sessions.sessions
+
     def test_changed_mode_replaces_session(self, monkeypatch):
         self._cat_terminal(monkeypatch)
         session_id = "term-test-session-replace"
@@ -2516,6 +2548,25 @@ class TestDashboardTerminalWebSocket:
         second_session = self._wait_for_session(session_id)
         assert second_session is not first_session
         assert second_session.identity == ("docker", "container_1")
+
+    def test_docker_shell_timeout_returns_terminal_error(self, monkeypatch):
+        def timed_out(*args, **kwargs):
+            raise self.ws_module.subprocess.TimeoutExpired(
+                cmd=args[0],
+                timeout=kwargs.get("timeout", 5),
+            )
+
+        monkeypatch.setattr(self.ws_module.subprocess, "run", timed_out)
+        from starlette.websockets import WebSocketDisconnect
+
+        with self.client.websocket_connect(
+            self._url(mode="docker", container="container_1")
+        ) as conn:
+            msg = conn.receive_text()
+            assert "Docker shell probe timed out." in msg
+            with pytest.raises(WebSocketDisconnect) as exc:
+                conn.receive_text()
+            assert exc.value.code == 1011
 
     def test_docker_list_handles_missing_docker(self, monkeypatch):
         def missing_docker(*args, **kwargs):
