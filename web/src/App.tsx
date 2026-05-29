@@ -73,6 +73,7 @@ import ProfilesPage from "@/pages/ProfilesPage";
 import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import ChatPage from "@/pages/ChatPage";
+import TerminalPage from "@/pages/TerminalPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -80,7 +81,10 @@ import type { Translations } from "@/i18n/types";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import {
+  isDashboardEmbeddedChatEnabled,
+  isDashboardTerminalEnabled,
+} from "@/lib/dashboard-flags";
 import { api } from "@/lib/api";
 import type { StatusResponse } from "@/lib/api";
 
@@ -101,6 +105,12 @@ const CHAT_NAV_ITEM: NavItem = {
   labelKey: "chat",
   label: "Chat",
   icon: Terminal,
+};
+
+const TERMINAL_NAV_ITEM: NavItem = {
+  path: "/terminal",
+  label: "Terminal",
+  icon: Code,
 };
 
 /**
@@ -345,7 +355,9 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
+  const isTerminalRoute = normalizedPath === "/terminal";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
+  const dashboardTerminal = isDashboardTerminalEnabled();
 
   // `dashboard.show_token_analytics` gates the Analytics nav item.  The
   // page itself remains reachable by URL (it renders an explanation when
@@ -390,18 +402,22 @@ export default function App() {
     () => ({
       ...BUILTIN_ROUTES_CORE,
       ...(embeddedChat ? { "/chat": ChatRouteSink } : {}),
+      ...(dashboardTerminal ? { "/terminal": TerminalPage } : {}),
     }),
-    [embeddedChat],
+    [dashboardTerminal, embeddedChat],
   );
 
   const builtinNav = useMemo(() => {
     const base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
       : BUILTIN_NAV_REST;
+    const withTerminal = dashboardTerminal
+      ? [TERMINAL_NAV_ITEM, ...base]
+      : base;
     return showTokenAnalytics
-      ? base
-      : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+      ? withTerminal
+      : withTerminal.filter((n) => n.path !== "/analytics");
+  }, [dashboardTerminal, embeddedChat, showTokenAnalytics]);
 
   const sidebarNav = useMemo(
     () => partitionSidebarNav(builtinNav, manifests),
@@ -685,7 +701,7 @@ export default function App() {
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
                 "px-3 sm:px-6",
-                isChatRoute
+                isChatRoute || isTerminalRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
                   : "pt-2 sm:pt-4 lg:pt-6",
                 isDocsRoute && "min-h-0 flex-1",
@@ -696,8 +712,9 @@ export default function App() {
                 className={cn(
                   "w-full min-w-0",
                   !isChatRoute &&
+                    !isTerminalRoute &&
                     "pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
-                  (isDocsRoute || isChatRoute) &&
+                  (isDocsRoute || isChatRoute || isTerminalRoute) &&
                     "min-h-0 flex flex-1 flex-col",
                 )}
               >
