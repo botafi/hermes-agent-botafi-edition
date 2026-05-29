@@ -49,9 +49,11 @@ def gated_app():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
     web_server.app.state.bound_host = "fly-app.fly.dev"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
+    web_server.app.state.allow_public = False
     client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     yield client
     clear_providers()
@@ -59,6 +61,7 @@ def gated_app():
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
 
 
 @pytest.fixture
@@ -69,15 +72,18 @@ def loopback_app():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
     web_server.app.state.bound_host = "127.0.0.1"
     web_server.app.state.bound_port = 8080
     web_server.app.state.auth_required = False
+    web_server.app.state.allow_public = False
     client = TestClient(web_server.app, base_url="http://127.0.0.1:8080")
     yield client
     _reset_for_tests()
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
 
 
 @pytest.fixture
@@ -88,15 +94,18 @@ def insecure_public_app():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
     web_server.app.state.bound_host = "0.0.0.0"
     web_server.app.state.bound_port = 9120
     web_server.app.state.auth_required = False
+    web_server.app.state.allow_public = True
     client = TestClient(web_server.app, base_url="http://192.168.0.222:9120")
     yield client
     _reset_for_tests()
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
 
 
 def _logged_in(client: TestClient) -> None:
@@ -175,15 +184,18 @@ def insecure_explicit_host_app():
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_allow_public = getattr(web_server.app.state, "allow_public", None)
     web_server.app.state.bound_host = "100.64.0.10"
     web_server.app.state.bound_port = 9119
     web_server.app.state.auth_required = False
+    web_server.app.state.allow_public = True
     client = TestClient(web_server.app, base_url="http://100.64.0.10:9119")
     yield client
     _reset_for_tests()
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+    web_server.app.state.allow_public = prev_allow_public
 
 
 def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/pty"):

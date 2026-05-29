@@ -136,11 +136,13 @@ def test_start_server_insecure_public_sets_auth_required_false(monkeypatch):
     """``--insecure`` (allow_public=True) on a public host: gate stays OFF."""
     _stub_uvicorn_run(monkeypatch)
     web_server.app.state.auth_required = None
+    web_server.app.state.allow_public = None
     web_server.start_server(
         host="0.0.0.0", port=9119,
         open_browser=False, allow_public=True,
     )
     assert web_server.app.state.auth_required is False
+    assert web_server.app.state.allow_public is True
 
 
 def test_start_server_public_without_insecure_records_auth_required(monkeypatch):
@@ -256,4 +258,5 @@ def test_start_server_insecure_keeps_proxy_headers_off(monkeypatch):
         open_browser=False, allow_public=True,
     )
     assert web_server.app.state.auth_required is False
+    assert web_server.app.state.allow_public is True
     assert captured["kwargs"].get("proxy_headers") is False
