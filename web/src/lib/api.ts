@@ -362,6 +362,8 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, enabled }),
     }),
+  getTerminalContainers: () =>
+    fetchJSON<TerminalContainersResponse>("/api/terminal/containers"),
   getToolsets: () => fetchJSON<ToolsetInfo[]>("/api/tools/toolsets"),
 
   // Session search (FTS5)
@@ -1007,4 +1009,17 @@ export interface AgentPluginUpdateResponse {
 export interface PluginProvidersPutRequest {
   memory_provider?: string;
   context_engine?: string;
+}
+
+export interface TerminalContainerInfo {
+  id: string;
+  name: string;
+  image: string;
+  status: string;
+}
+
+export interface TerminalContainersResponse {
+  enabled: boolean;
+  containers: TerminalContainerInfo[];
+  error: string | null;
 }

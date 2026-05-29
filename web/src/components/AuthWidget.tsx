@@ -23,7 +23,7 @@
  *     so the user knows the widget tried.
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api, type AuthMeResponse } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { LogOut } from "lucide-react";
@@ -41,9 +41,9 @@ function truncateUserId(id: string): string {
 }
 
 export function AuthWidget({ className }: AuthWidgetProps) {
-  const [me, setMe] = useState<AuthMeResponse | null>(null);
-  const [hidden, setHidden] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [me] = useState<AuthMeResponse | null>(null);
+  const [hidden] = useState(true);
+  const [error] = useState<string | null>(null);
 
   // useEffect(() => {
   //   let cancelled = false;

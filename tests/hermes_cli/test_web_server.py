@@ -2373,6 +2373,173 @@ class TestPtyWebSocket:
         assert exc.value.code == 4400
 
 
+@skip_on_windows
+class TestDashboardTerminalWebSocket:
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, _isolate_hermes_home):
+        from starlette.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        self.ws_module = ws
+        self.token = ws._SESSION_TOKEN
+        monkeypatch.setenv("HERMES_DASHBOARD_TERMINAL", "1")
+        monkeypatch.setenv("HERMES_DASHBOARD_TERMINAL_RECONNECT_GRACE_SECONDS", "2")
+        monkeypatch.setattr(ws, "_terminal_sessions", ws._TerminalSessionRegistry())
+        self.client = TestClient(ws.app)
+        self.client.headers[ws._SESSION_HEADER_NAME] = ws._SESSION_TOKEN
+
+    def _url(self, token: str | None = None, **params: str) -> str:
+        from urllib.parse import urlencode
+
+        tok = token if token is not None else self.token
+        q = {
+            "token": tok,
+            "session": "term-test-session-0001",
+            "mode": "host",
+            **params,
+        }
+        return f"/api/terminal/pty?{urlencode(q)}"
+
+    def _cat_terminal(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_terminal_argv",
+            lambda mode, container=None: (["/bin/cat"], None, os.environ.copy()),
+        )
+
+    def _wait_for_session(self, session_id: str):
+        import time
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            session = self.ws_module._terminal_sessions.sessions.get(session_id)
+            if session is not None:
+                return session
+            time.sleep(0.01)
+        raise AssertionError(f"terminal session {session_id!r} was not registered")
+
+    def test_rejects_when_terminal_disabled(self, monkeypatch):
+        monkeypatch.delenv("HERMES_DASHBOARD_TERMINAL", raising=False)
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(self._url()):
+                pass
+        assert exc.value.code == 4403
+
+    def test_rejects_bad_token(self, monkeypatch):
+        self._cat_terminal(monkeypatch)
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(self._url(token="wrong")):
+                pass
+        assert exc.value.code == 4401
+
+    def test_host_terminal_echoes_input(self, monkeypatch):
+        self._cat_terminal(monkeypatch)
+
+        with self.client.websocket_connect(self._url()) as conn:
+            conn.send_text("terminal-round-trip\n")
+            buf = b""
+            import time
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                frame = conn.receive_bytes()
+                if frame:
+                    buf += frame
+                if b"terminal-round-trip" in buf:
+                    break
+            assert b"terminal-round-trip" in buf
+
+    def test_reconnect_reuses_session_during_grace(self, monkeypatch):
+        self._cat_terminal(monkeypatch)
+        session_id = "term-test-session-reuse"
+
+        with self.client.websocket_connect(self._url(session=session_id)) as conn:
+            conn.send_text("first-pass\n")
+            assert b"first-pass" in conn.receive_bytes()
+
+        first_session = self._wait_for_session(session_id)
+        assert first_session.active is False
+
+        with self.client.websocket_connect(self._url(session=session_id)) as conn:
+            assert self.ws_module._terminal_sessions.sessions[session_id] is first_session
+            conn.send_text("second-pass\n")
+            buf = b""
+            import time
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                frame = conn.receive_bytes()
+                if frame:
+                    buf += frame
+                if b"second-pass" in buf:
+                    break
+            assert b"second-pass" in buf
+
+    def test_grace_expiry_removes_session(self, monkeypatch):
+        self._cat_terminal(monkeypatch)
+        monkeypatch.setenv("HERMES_DASHBOARD_TERMINAL_RECONNECT_GRACE_SECONDS", "0.1")
+        session_id = "term-test-session-expire"
+
+        with self.client.websocket_connect(self._url(session=session_id)) as conn:
+            conn.send_text("expire-me\n")
+            assert b"expire-me" in conn.receive_bytes()
+
+        # TestClient tears down per-connection background tasks aggressively;
+        # exercise the same grace callback directly so this stays deterministic
+        # while still asserting the registry removes and closes the session.
+        import asyncio
+
+        asyncio.run(self.ws_module._terminal_sessions._close_after_grace(session_id, 0))
+        assert session_id not in self.ws_module._terminal_sessions.sessions
+
+    def test_changed_mode_replaces_session(self, monkeypatch):
+        self._cat_terminal(monkeypatch)
+        session_id = "term-test-session-replace"
+
+        with self.client.websocket_connect(self._url(session=session_id)) as conn:
+            conn.send_text("replace-first\n")
+            assert b"replace-first" in conn.receive_bytes()
+
+        first_session = self._wait_for_session(session_id)
+
+        with self.client.websocket_connect(
+            self._url(session=session_id, mode="docker", container="container_1")
+        ) as conn:
+            conn.send_text("replace-second\n")
+            assert b"replace-second" in conn.receive_bytes()
+
+        second_session = self._wait_for_session(session_id)
+        assert second_session is not first_session
+        assert second_session.identity == ("docker", "container_1")
+
+    def test_docker_list_handles_missing_docker(self, monkeypatch):
+        def missing_docker(*args, **kwargs):
+            raise FileNotFoundError("docker")
+
+        monkeypatch.setattr(self.ws_module.subprocess, "run", missing_docker)
+
+        resp = self.client.get("/api/terminal/containers")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["containers"] == []
+        assert "Docker command not found" in data["error"]
+
+    def test_rejects_malformed_container(self):
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(
+                self._url(mode="docker", container="../bad")
+            ):
+                pass
+        assert exc.value.code == 1008
+
+
 class TestDashboardPluginStaticAssetAllowlist:
     """``/dashboard-plugins/<name>/<path>`` is unauthenticated by design —
     the SPA loads plugin JS via ``<script src>`` and CSS via
@@ -2445,4 +2612,3 @@ class TestDashboardPluginStaticAssetAllowlist:
         # 403 traversal-blocked OR 404 (depending on URL decode order)
         # — never 200.
         assert resp.status_code in (403, 404)
-
