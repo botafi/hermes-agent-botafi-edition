@@ -77,6 +77,82 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     return agent
 
 
+def _hosted_search_default_config():
+    return {
+        "enabled": "auto",
+        "providers": {
+            "openai-api": {
+                "enabled": "auto",
+                "model_allow": ["gpt-5.4*", "gpt-5.5*", "gpt-6*"],
+                "model_deny": ["gpt-5.4-nano*"],
+            },
+            "openai-codex": {
+                "enabled": "auto",
+                "model_allow": ["gpt-5.4*", "gpt-5.5*", "gpt-6*"],
+                "model_deny": ["gpt-5.4-nano*"],
+            },
+        },
+    }
+
+
+def test_agent_init_skips_hermes_tool_search_for_openai_hosted(monkeypatch):
+    calls = []
+
+    def _fake_get_tool_definitions(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", _fake_get_tool_definitions)
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(
+        "agent.hosted_tool_search._hosted_search_config",
+        _hosted_search_default_config,
+    )
+
+    run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert calls[-1]["skip_tool_search_assembly"] is True
+
+
+def test_agent_init_keeps_hermes_tool_search_for_other_responses_providers(monkeypatch):
+    calls = []
+
+    def _fake_get_tool_definitions(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", _fake_get_tool_definitions)
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(
+        "agent.hosted_tool_search._hosted_search_config",
+        _hosted_search_default_config,
+    )
+
+    run_agent.AIAgent(
+        model="openai/gpt-5.4",
+        provider="gmi",
+        api_mode="codex_responses",
+        base_url="https://api.gmi-serving.com/v1",
+        api_key="gmi-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert calls[-1]["skip_tool_search_assembly"] is False
+
+
 def _codex_message_response(text: str):
     return SimpleNamespace(
         output=[
