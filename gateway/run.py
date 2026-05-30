@@ -2525,17 +2525,60 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
-        """Build the effective model/runtime config for a single turn.
+    def _resolve_live_call_context(self, event: Optional[MessageEvent]) -> Optional[dict]:
+        """Return live-call metadata for events handled while Hermes is in a call.
 
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        ``MessageType.VOICE`` alone is not enough: uploaded voice notes also use
+        that type. This helper detects explicit call-marked events plus typed
+        Discord text-channel messages bound to an active joined voice channel.
         """
-        from hermes_cli.models import resolve_fast_mode_overrides
+        if event is None:
+            return None
 
-        runtime = {
+        explicit = getattr(event, "live_call_context", None)
+        if isinstance(explicit, dict):
+            if explicit.get("active", True) is False:
+                return None
+            return dict(explicit)
+        if explicit:
+            return {"active": True}
+
+        source = getattr(event, "source", None)
+        if not source or source.platform != Platform.DISCORD:
+            return None
+        if event.message_type not in {MessageType.TEXT, MessageType.COMMAND}:
+            # Only infer call mode for typed messages in the linked text
+            # channel. Actual voice-channel transcripts are marked explicitly
+            # with live_call_context; uploaded voice notes are not live calls.
+            return None
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter:
+            return None
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            return None
+        voice_text_channels = getattr(adapter, "_voice_text_channels", {}) or {}
+        linked_chat_id = voice_text_channels.get(guild_id)
+        if linked_chat_id is None or str(linked_chat_id) != str(source.chat_id):
+            return None
+        if hasattr(adapter, "is_in_voice_channel") and not adapter.is_in_voice_channel(guild_id):
+            return None
+        return {
+            "active": True,
+            "platform": "discord",
+            "guild_id": guild_id,
+            "chat_id": str(source.chat_id or ""),
+        }
+
+    @staticmethod
+    def _voice_customization_config(user_config: Optional[dict]) -> dict:
+        cfg = (user_config or {}).get("voice_customization")
+        return cfg if isinstance(cfg, dict) else {}
+
+    @staticmethod
+    def _normalize_runtime_for_agent(runtime_kwargs: dict) -> dict:
+        return {
             "api_key": runtime_kwargs.get("api_key"),
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
@@ -2544,6 +2587,123 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
+
+    def _resolve_live_call_agent_runtime(
+        self,
+        *,
+        model: str,
+        runtime_kwargs: dict,
+        user_config: Optional[dict],
+    ) -> tuple[str, dict, str, dict]:
+        """Overlay ``voice_customization`` on a normal session runtime.
+
+        Returns ``(model, runtime_kwargs, additional_prompt, main_runtime)``.
+        ``main_runtime`` preserves the pre-overlay runtime so delegate_task can
+        route complex work back to the main model when configured to do so.
+        """
+        cfg = self._voice_customization_config(user_config)
+        main_runtime = {
+            "model": model,
+            "provider": runtime_kwargs.get("provider"),
+            "base_url": runtime_kwargs.get("base_url"),
+            "api_key": runtime_kwargs.get("api_key"),
+            "api_mode": runtime_kwargs.get("api_mode"),
+            "command": runtime_kwargs.get("command"),
+            "args": list(runtime_kwargs.get("args") or []),
+            "credential_pool": runtime_kwargs.get("credential_pool"),
+        }
+
+        additional_prompt = str(cfg.get("additional_prompt") or "").strip()
+        configured_model = str(cfg.get("model") or "").strip()
+        configured_provider = str(cfg.get("provider") or "").strip()
+        configured_base_url = str(cfg.get("base_url") or "").strip()
+        configured_api_key = str(cfg.get("api_key") or "").strip()
+        configured_api_mode = str(cfg.get("api_mode") or "").strip().lower()
+
+        if not any((configured_model, configured_provider, configured_base_url)):
+            return model, runtime_kwargs, additional_prompt, main_runtime
+
+        voice_model = configured_model or model
+        if configured_base_url:
+            from hermes_cli.runtime_provider import _detect_api_mode_for_url
+            from utils import base_url_hostname
+
+            base_lower = configured_base_url.lower()
+            voice_provider = configured_provider or "custom"
+            voice_api_mode = _detect_api_mode_for_url(configured_base_url) or "chat_completions"
+            if (
+                base_url_hostname(configured_base_url) == "chatgpt.com"
+                and "/backend-api/codex" in base_lower
+            ):
+                voice_provider = configured_provider or "openai-codex"
+                voice_api_mode = "codex_responses"
+            elif base_url_hostname(configured_base_url) == "api.anthropic.com":
+                voice_provider = configured_provider or "anthropic"
+                voice_api_mode = "anthropic_messages"
+            if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+                voice_api_mode = configured_api_mode
+            voice_runtime = self._normalize_runtime_for_agent(runtime_kwargs)
+            voice_runtime.update(
+                {
+                    "api_key": configured_api_key or runtime_kwargs.get("api_key"),
+                    "base_url": configured_base_url,
+                    "provider": voice_provider,
+                    "api_mode": voice_api_mode,
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                }
+            )
+            return voice_model, voice_runtime, additional_prompt, main_runtime
+
+        if configured_provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                resolved = resolve_runtime_provider(
+                    requested=configured_provider,
+                    target_model=voice_model or None,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not resolve voice_customization.provider "
+                    f"{configured_provider!r}: {exc}"
+                ) from exc
+            voice_runtime = {
+                "api_key": configured_api_key or resolved.get("api_key"),
+                "base_url": resolved.get("base_url"),
+                "provider": resolved.get("provider") or configured_provider,
+                "api_mode": configured_api_mode or resolved.get("api_mode"),
+                "command": resolved.get("command"),
+                "args": list(resolved.get("args") or []),
+                "credential_pool": resolved.get("credential_pool"),
+            }
+            if not voice_runtime.get("api_key"):
+                raise RuntimeError(
+                    f"voice_customization.provider {configured_provider!r} "
+                    "resolved without an API key."
+                )
+            return voice_model or resolved.get("model") or model, voice_runtime, additional_prompt, main_runtime
+
+        voice_runtime = self._normalize_runtime_for_agent(runtime_kwargs)
+        if configured_api_key:
+            voice_runtime["api_key"] = configured_api_key
+        if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+            voice_runtime["api_mode"] = configured_api_mode
+        return voice_model, voice_runtime, additional_prompt, main_runtime
+
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+        """Build the effective model/runtime config for a single turn.
+
+        The caller passes the already-resolved turn runtime: normally the
+        session's primary model/provider, but live-call turns may pass a
+        ``voice_customization`` overlay. If `/fast` is enabled and the model
+        supports Priority Processing / Anthropic fast mode, attach
+        `request_overrides` so the API call is marked accordingly.
+        """
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        runtime = self._normalize_runtime_for_agent(runtime_kwargs)
         route = {
             "model": model,
             "runtime": runtime,
@@ -9031,6 +9191,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                live_call_context=self._resolve_live_call_context(event),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -11661,6 +11822,12 @@ class GatewayRunner:
             text=transcript,
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            live_call_context={
+                "active": True,
+                "platform": "discord",
+                "guild_id": guild_id,
+                "chat_id": str(text_ch_id),
+            },
         )
 
         await adapter.handle_message(event)
@@ -16330,6 +16497,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        live_call_context: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17033,7 +17201,8 @@ class GatewayRunner:
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
             
             # Combine platform context, per-channel context, and the user-configured
-            # ephemeral system prompt.
+            # ephemeral system prompt. Live-call customization is appended after
+            # runtime resolution below because it is coupled to voice_customization.
             combined_ephemeral = context_prompt or ""
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
@@ -17056,6 +17225,33 @@ class GatewayRunner:
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
+                live_call_main_runtime = None
+                live_call_delegate_to_main = False
+                if live_call_context:
+                    (
+                        model,
+                        runtime_kwargs,
+                        live_call_prompt,
+                        live_call_main_runtime,
+                    ) = self._resolve_live_call_agent_runtime(
+                        model=model,
+                        runtime_kwargs=runtime_kwargs,
+                        user_config=user_config,
+                    )
+                    if live_call_prompt:
+                        combined_ephemeral = (
+                            combined_ephemeral + "\n\n" + live_call_prompt
+                        ).strip()
+                    live_cfg = self._voice_customization_config(user_config)
+                    live_call_delegate_to_main = bool(
+                        live_cfg.get("delegate_complex_tasks_to_main", True)
+                    )
+                    logger.debug(
+                        "live-call runtime resolved: model=%s provider=%s session=%s",
+                        model,
+                        runtime_kwargs.get("provider"),
+                        session_key or "",
+                    )
             except Exception as exc:
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
@@ -17180,12 +17376,16 @@ class GatewayRunner:
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_keys = self._extract_cache_busting_config(user_config)
+            _cache_keys["voice_customization.active"] = bool(live_call_context)
+            if live_call_context:
+                _cache_keys["voice_customization.config"] = self._voice_customization_config(user_config)
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys=_cache_keys,
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
@@ -17246,6 +17446,15 @@ class GatewayRunner:
                         _cache[session_key] = (agent, _sig)
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
+
+            agent._live_call_delegate_to_main = bool(
+                live_call_context and live_call_delegate_to_main
+            )
+            agent._live_call_main_runtime = (
+                dict(live_call_main_runtime)
+                if live_call_context and live_call_delegate_to_main and live_call_main_runtime
+                else None
+            )
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
@@ -18474,6 +18683,7 @@ class GatewayRunner:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                next_live_call_context = self._resolve_live_call_context(pending_event)
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -18499,6 +18709,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    live_call_context=next_live_call_context,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

@@ -126,6 +126,19 @@ Always-present tools default to:
 - Keeps this downstream's existing Mistral support and uses auto-detect order:
   `local > groq > elevenlabs > openai > mistral > xai`.
 
+## Live-call voice customization
+
+- Adds `voice_customization` config for realtime call sessions, separate from
+  generic STT/TTS and uploaded voice messages.
+- Lets Discord `/voice join` sessions run on a smaller call-mode model and
+  inject an additional live-call prompt without changing normal text chats.
+- Marks joined-call events explicitly with `live_call_context`, and treats
+  typed messages in the linked Discord text channel as live-call turns while
+  the bot remains connected to voice.
+- Preserves the main session runtime for `delegate_task` when
+  `delegate_complex_tasks_to_main` is enabled, unless `delegation.*` is
+  explicitly configured.
+
 ## Tests, docs, and config coverage
 
 - Adds and updates tests for terminal/file backend overrides, approval scoping,
