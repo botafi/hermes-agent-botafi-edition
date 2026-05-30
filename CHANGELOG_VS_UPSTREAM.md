@@ -1,6 +1,6 @@
 # Downstream changelog vs upstream/main
 
-This branch is currently 11 commits ahead of `upstream/main`. The downstream
+This branch is currently 14 commits ahead of `upstream/main`. The downstream
 changes are grouped below by feature area rather than commit order.
 
 ## Dashboard terminal and web security
@@ -108,10 +108,29 @@ Always-present tools default to:
 - Saves dumps under `~/.hermes/debug/context_dumps/` and uploads them through
   the platform adapter when file upload is available.
 
+## ElevenLabs Scribe speech-to-text
+
+- Ports upstream PR NousResearch/hermes-agent#19777 into downstream and resolves
+  it against the current `origin/main`.
+- Adds `stt.provider: elevenlabs` as a built-in STT provider using direct
+  multipart `POST /v1/speech-to-text` requests with the `xi-api-key` header.
+- Defaults to `scribe_v2`, documents `scribe_v1`, and passes through explicit
+  future or custom model IDs to the ElevenLabs API.
+- Supports `stt.elevenlabs` options for `language_code`, `diarize`,
+  `tag_audio_events`, and `timestamps_granularity`.
+- Adds quota fallback rotation from `ELEVENLABS_API_KEY` through
+  `ELEVENLABS_API_KEY_10` on quota, credit, auth, and rate-limit responses.
+- Adds `hermes setup stt`, dashboard config support, docs, example config, and
+  focused tests for setup, dispatch, rotation, voice-mode checks, and registry
+  sync.
+- Keeps this downstream's existing Mistral support and uses auto-detect order:
+  `local > groq > elevenlabs > openai > mistral > xai`.
+
 ## Tests, docs, and config coverage
 
 - Adds and updates tests for terminal/file backend overrides, approval scoping,
   Responses hosted tool search, dashboard auth, dashboard terminals, kanban
-  project/workspace behavior, MCP descriptions, and `/context-dump`.
+  project/workspace behavior, MCP descriptions, ElevenLabs Scribe STT, and
+  `/context-dump`.
 - Updates `cli-config.yaml.example`, default config, MCP reference docs, and
-  kanban user docs for the new downstream options.
+  kanban and voice-mode user docs for the new downstream options.
