@@ -903,11 +903,28 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
-    # Get available tools with filtering
+    # Get available tools with filtering. Official OpenAI Responses surfaces
+    # can use hosted tool_search/defer_loading, so keep the full local tool
+    # catalog here and let the Responses transport form hosted namespaces.
+    # Other providers keep Hermes' provider-agnostic tool_search bridge.
+    skip_tool_search_assembly = False
+    if getattr(agent, "api_mode", None) == "codex_responses":
+        try:
+            from agent.hosted_tool_search import provider_supports_hosted_tool_search
+
+            skip_tool_search_assembly = provider_supports_hosted_tool_search(
+                provider=getattr(agent, "provider", None),
+                model=getattr(agent, "model", None),
+                base_url=getattr(agent, "base_url", None),
+            )
+        except Exception:
+            skip_tool_search_assembly = False
+
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
     )
     
     # Show tool configuration and store valid tool names for validation
