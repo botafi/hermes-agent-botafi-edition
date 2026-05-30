@@ -937,6 +937,8 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+        assert event.live_call_context["platform"] == "discord"
+        assert event.live_call_context["guild_id"] == 111
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):

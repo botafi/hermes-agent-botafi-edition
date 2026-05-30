@@ -1335,6 +1335,11 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # Marks input that belongs to a live call the agent has joined (Discord
+    # voice channel, meeting bridge, telephony call, etc.). Generic uploaded
+    # voice notes remain MessageType.VOICE without this marker.
+    live_call_context: Optional[Dict[str, Any]] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.

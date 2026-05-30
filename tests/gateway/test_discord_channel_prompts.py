@@ -30,7 +30,7 @@ def _ensure_discord_mock():
 
 import gateway.run as gateway_run
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -256,3 +256,139 @@ async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monke
     assert _CapturingAgent.last_init["ephemeral_system_prompt"] == (
         "Context prompt\n\nChannel prompt\n\nGlobal prompt"
     )
+
+
+@pytest.mark.asyncio
+async def test_live_call_customization_overlays_model_and_prompt(monkeypatch):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "voice_customization": {
+                "model": "small-voice-model",
+                "additional_prompt": "Use live-call behavior.",
+            }
+        },
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "main-model")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="Context prompt",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:discord:thread:12345",
+        live_call_context={"active": True, "platform": "discord"},
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["model"] == "small-voice-model"
+    assert _CapturingAgent.last_init["provider"] == "openrouter"
+    assert _CapturingAgent.last_init["ephemeral_system_prompt"] == (
+        "Context prompt\n\nGlobal prompt\n\nUse live-call behavior."
+    )
+
+
+@pytest.mark.asyncio
+async def test_voice_upload_does_not_apply_live_call_customization(monkeypatch):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "voice_customization": {
+                "model": "small-voice-model",
+                "additional_prompt": "Use live-call behavior.",
+            }
+        },
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "main-model")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message="transcribed voice note",
+        context_prompt="Context prompt",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:discord:thread:12345",
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["model"] == "main-model"
+    assert _CapturingAgent.last_init["ephemeral_system_prompt"] == (
+        "Context prompt\n\nGlobal prompt"
+    )
+
+
+def test_resolve_live_call_context_for_linked_discord_text_channel():
+    runner = _make_runner()
+    adapter = SimpleNamespace(
+        _voice_text_channels={111: 12345},
+        is_in_voice_channel=lambda guild_id: guild_id == 111,
+    )
+    runner.adapters[Platform.DISCORD] = adapter
+    event = MessageEvent(
+        text="typed while in the call",
+        message_type=MessageType.TEXT,
+        source=_make_source(),
+        raw_message=SimpleNamespace(guild_id=111, guild=None),
+    )
+
+    context = runner._resolve_live_call_context(event)
+
+    assert context is not None
+    assert context["platform"] == "discord"
+    assert context["guild_id"] == 111
+
+
+def test_resolve_live_call_context_ignores_linked_channel_voice_upload():
+    runner = _make_runner()
+    adapter = SimpleNamespace(
+        _voice_text_channels={111: 12345},
+        is_in_voice_channel=lambda guild_id: guild_id == 111,
+    )
+    runner.adapters[Platform.DISCORD] = adapter
+    event = MessageEvent(
+        text="voice upload",
+        message_type=MessageType.VOICE,
+        source=_make_source(),
+        raw_message=SimpleNamespace(guild_id=111, guild=None),
+    )
+
+    assert runner._resolve_live_call_context(event) is None

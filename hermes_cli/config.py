@@ -1502,6 +1502,19 @@ DEFAULT_CONFIG = {
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
     },
+
+    # Live-call voice customization. Applies only when Hermes has joined a
+    # realtime call/voice channel (for example Discord /voice join), not to
+    # generic uploaded voice messages, STT, or TTS-only replies.
+    "voice_customization": {
+        "model": "",        # Empty = keep the normal session model
+        "provider": "",     # Empty = keep the normal session provider/runtime
+        "base_url": "",     # Direct OpenAI-compatible endpoint for call mode
+        "api_key": "",      # API key for voice_customization.base_url/provider
+        "api_mode": "",     # "chat_completions", "codex_responses", or "anthropic_messages"
+        "additional_prompt": "",
+        "delegate_complex_tasks_to_main": True,
+    },
     
     "human_delay": {
         "mode": "off",

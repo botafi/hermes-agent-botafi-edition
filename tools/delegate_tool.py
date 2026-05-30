@@ -2369,6 +2369,23 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
+    if not configured_model and not configured_provider and not configured_base_url:
+        live_main = getattr(parent_agent, "_live_call_main_runtime", None)
+        if (
+            getattr(parent_agent, "_live_call_delegate_to_main", False)
+            and isinstance(live_main, dict)
+            and live_main.get("model")
+        ):
+            return {
+                "model": live_main.get("model"),
+                "provider": live_main.get("provider"),
+                "base_url": live_main.get("base_url"),
+                "api_key": live_main.get("api_key"),
+                "api_mode": live_main.get("api_mode"),
+                "command": live_main.get("command"),
+                "args": list(live_main.get("args") or []),
+            }
+
     if configured_base_url:
         # When delegation.api_key is not set, return None so _build_child_agent
         # falls back to the parent agent's API key via the credential inheritance
